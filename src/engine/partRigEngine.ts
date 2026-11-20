@@ -201,7 +201,7 @@ export class PartRigManager {
     });
 
     const gotzMirror = key === 'hand' ? (id === 'handR' ? true : id === 'handL' ? false : mir) : false;
-    const gotzDefault = key === 'hand' ? createDefaultGotzHandState(gotzMirror, 'Neutral') : undefined;
+    const gotzDefault = key === 'hand' ? createDefaultGotzHandState(gotzMirror, 'Fist') : undefined;
     const mgr = this;
 
     this.inst[id] = {

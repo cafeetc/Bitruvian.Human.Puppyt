@@ -206,7 +206,10 @@ export const GotzHandEditor: React.FC<GotzHandEditorProps> = ({ part, onClose, o
     if (svg && svg.hasPointerCapture(e.pointerId)) {
       svg.releasePointerCapture(e.pointerId);
     }
-    dragRef.current = null;
+    if (dragRef.current) {
+      dragRef.current = null;
+      setTick((t) => t + 1);
+    }
   };
 
   const handleContextMenu = (e: React.MouseEvent<SVGSVGElement>) => {
@@ -350,6 +353,44 @@ export const GotzHandEditor: React.FC<GotzHandEditorProps> = ({ part, onClose, o
     });
   }, [collapsedDigits, tree]);
 
+  const stageAngleDeg = alignToScreen && screenAngleDeg != null ? screenAngleDeg : 0;
+  const stageViewBoxRef = useRef<string>('-6.2 -10.4 12.4 12.2');
+  const stageViewBox = useMemo(() => {
+    // Freeze viewBox while dragging a fingertip/knuckle so getScreenCTM stays stable under the cursor
+    if (dragRef.current) return stageViewBoxRef.current;
+    const rad = (stageAngleDeg * Math.PI) / 180;
+    const cosA = Math.cos(rad);
+    const sinA = Math.sin(rad);
+    let minX = 0;
+    let maxX = 0;
+    let minY = 0;
+    let maxY = 0;
+    for (const d of activeDigits) {
+      for (const [gx, gy] of solved[d].pts) {
+        const mx = st.mirror ? -gx : gx;
+        const rx = mx * cosA - gy * sinA;
+        const ry = mx * sinA + gy * cosA;
+        if (rx < minX) minX = rx;
+        if (rx > maxX) maxX = rx;
+        if (ry < minY) minY = ry;
+        if (ry > maxY) maxY = ry;
+      }
+    }
+    const padSide = 1.65;
+    const padTop = 1.7;
+    const padBottom = 2.25; // extra bottom breathing room above Wrist Dial & hint bar
+    const rawW = maxX - minX + padSide * 2;
+    const rawH = maxY - minY + padTop + padBottom;
+    const minSpan = 8.4;
+    const w = Math.max(minSpan, rawW);
+    const h = Math.max(minSpan, rawH);
+    const cx = (minX + maxX) * 0.5;
+    const cy = (minY - padTop + maxY + padBottom) * 0.5;
+    const vb = `${(cx - w * 0.5).toFixed(2)} ${(cy - h * 0.5).toFixed(2)} ${w.toFixed(2)} ${h.toFixed(2)}`;
+    stageViewBoxRef.current = vb;
+    return vb;
+  }, [activeDigits, solved, st.mirror, stageAngleDeg]);
+
   return (
     <div className="fixed inset-2 z-40 flex flex-col overflow-hidden rounded-lg border border-[#2b2f36] bg-[#191b1f] shadow-[0_12px_48px_rgba(0,0,0,0.78)] md:inset-[3%] md:flex-row">
       {/* Interactive Gotz SVG Stage */}
@@ -380,7 +421,8 @@ export const GotzHandEditor: React.FC<GotzHandEditorProps> = ({ part, onClose, o
 
         <svg
           ref={svgRef}
-          viewBox="-6.2 -10.4 12.4 12.2"
+          viewBox={stageViewBox}
+          preserveAspectRatio="xMidYMid meet"
           onPointerDown={handleStagePointerDown}
           onPointerMove={handleStagePointerMove}
           onPointerUp={handleStagePointerUp}
@@ -391,9 +433,7 @@ export const GotzHandEditor: React.FC<GotzHandEditorProps> = ({ part, onClose, o
         >
           <g
             ref={handGroupRef}
-            transform={`rotate(${alignToScreen && screenAngleDeg != null ? screenAngleDeg : 0}) ${
-              st.mirror ? 'scale(-1, 1)' : ''
-            }`}
+            transform={`rotate(${stageAngleDeg}) ${st.mirror ? 'scale(-1, 1)' : ''}`}
           >
             {/* Proportional 4:3:2:1 Arcs & Radial Guides */}
             {st.guides && (
@@ -415,11 +455,11 @@ export const GotzHandEditor: React.FC<GotzHandEditorProps> = ({ part, onClose, o
               </g>
             )}
 
-            {/* Subtle Palm Web (Purple fill #5a10d8 with black outline #000000) */}
+            {/* Subtle Palm Web (Purple fill #5d03b4 with black outline #000000) */}
             {palmWebPoints && (
               <polygon
                 points={palmWebPoints}
-                fill="#5a10d8"
+                fill="#5d03b4"
                 fillOpacity={0.92}
                 stroke="#000000"
                 strokeWidth={0.08}
@@ -445,7 +485,7 @@ export const GotzHandEditor: React.FC<GotzHandEditorProps> = ({ part, onClose, o
                         <g key={boneId} transform={`translate(${seg.x1},${seg.y1}) rotate(${deg})`}>
                           <path
                             d={dPath}
-                            fill="#5a10d8"
+                            fill="#5d03b4"
                             stroke={isSel ? '#ff3b6b' : isHov ? '#34d399' : '#000000'}
                             strokeWidth={isSel || isHov ? 0.12 : 0.085}
                             strokeLinejoin="round"
@@ -491,7 +531,7 @@ export const GotzHandEditor: React.FC<GotzHandEditorProps> = ({ part, onClose, o
               cx={0}
               cy={0}
               r={0.34}
-              fill="#5a10d8"
+              fill="#5d03b4"
               stroke={selectedBoneId === 'wrist' ? '#ff3b6b' : '#000000'}
               strokeWidth={0.095}
               onClick={(ev) => {

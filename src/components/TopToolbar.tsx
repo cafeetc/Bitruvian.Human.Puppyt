@@ -9,11 +9,13 @@ interface TopToolbarProps {
   ikMode: IKMode;
   showBones: boolean;
   showGuides: boolean;
+  showPersp?: boolean;
   onTogglePanel: (id: PanelId) => void;
   onModeChange: (mode: RenderMode) => void;
   onIkModeChange: (ikMode: IKMode) => void;
   onToggleBones: (v: boolean) => void;
   onToggleGuides: (v: boolean) => void;
+  onTogglePersp?: (v: boolean) => void;
   onFit: () => void;
 }
 
@@ -34,11 +36,13 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
   ikMode,
   showBones,
   showGuides,
+  showPersp = true,
   onTogglePanel,
   onModeChange,
   onIkModeChange,
   onToggleBones,
   onToggleGuides,
+  onTogglePersp,
   onFit,
 }) => {
   return (
@@ -124,6 +128,21 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
         />
         <span>guides</span>
       </label>
+
+      {onTogglePersp && (
+        <label
+          title="1-point perspective grid, draggable Horizon, Ground & Vanishing Point (VP)"
+          className="flex cursor-pointer items-center gap-1 whitespace-nowrap shrink-0 rounded px-1 py-1 text-[11.5px] text-[#c7cbd3] hover:text-white sm:gap-1.5 sm:px-1.5 sm:text-[12px]"
+        >
+          <input
+            type="checkbox"
+            checked={showPersp}
+            onChange={(e) => onTogglePersp(e.target.checked)}
+            className="accent-[#a855f7]"
+          />
+          <span>persp</span>
+        </label>
+      )}
 
       <span className="mx-0.5 h-4 w-px shrink-0 bg-[#2b2f36]" aria-hidden="true" />
 

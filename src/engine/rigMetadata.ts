@@ -7,8 +7,8 @@ import type { EffectorRole, LimbChainDef } from './types';
  */
 export const ANATOMICAL_LIMITS: Record<string, [number, number]> = {
   pelvis: [-180, 180],
-  hipR: [-12, 12],
-  hipL: [-12, 12],
+  hipR: [-145, 145],
+  hipL: [-145, 145],
   lumbar: [-48, 48],
   thorax: [-42, 42],
   ribR: [-28, 28],
@@ -123,6 +123,7 @@ export const GITHUB_ROADMAP: RoadmapPhase[] = [
       'FPS cadence gate & Fluid / Elastic / Snap (Snap/Flow/Mech/Clock) modes',
       'Draggable Snap Bar (A/B/C poses, translucent onion-skin ghosts, ping-pong loop)',
       'Clockwork stage sequencer with per-bone cubic-bezier curves, anticipation & stagger',
+      'Walk cycle perspective shifts synchronized to full-model locomotion across the stage',
     ],
   },
   {

@@ -20,10 +20,13 @@ import { TopToolbar } from './components/TopToolbar';
 import { StageRenderer, type AbcGhostItem } from './engine/canvasRenderer';
 import {
   DEG,
+  applyChungusChestCavity,
   applyPoseSnapshot,
+  applyRibAnchorMode,
   buildRigGraph,
   capturePoseSnapshot,
   clampAnatomicalAngle,
+  clampChungusRibAngle,
   clampRealisticShoulder,
   computeModelFrame,
   decImage,
@@ -38,20 +41,26 @@ import {
   setPieceBitmap,
   solveRig,
   sortPiecesForWings,
+  type RibAnchorMode,
 } from './engine/fkEngine';
 import { applyGotzPreset, getGotzPoseCode } from './engine/gotzHandEngine';
+import { applySkullView, type SkullViewMode } from './engine/skullKitModels';
 import {
   DEFAULT_IK_CONFIG,
   FBIK_CHAIN_NODES,
   LONG_IK_MS,
+  PERSP_DEFAULT,
+  anchorFigureOnPerspectiveShift,
   applyBalanceAndPins,
   captureFBIKBaseline,
   capturePoseIKSnapshot,
   enforceGroundContact,
   findLimbChainForNode,
   getWorldDir,
+  hitPerspHandle,
   limbLengths,
   setWorldDirExact,
+  solveAnalyticalLimbIK,
   solveFullBodyIKDrag,
   solveLimbChain,
   syncPinsFromRig,
@@ -90,6 +99,8 @@ import type {
   PanelId,
   PartRigInstance,
   PartsManifest,
+  PerspHandle,
+  PerspectiveState,
   PoseSnapshot,
   RawRigDef,
   RenderMode,
@@ -121,6 +132,9 @@ interface RigRuntime {
   bondOn: boolean;
   constrainLimits: boolean;
   prometheusWings: boolean;
+  superWings: boolean;
+  ribAnchor: RibAnchorMode;
+  skullView: SkullViewMode;
   wingPop: number;
   wingTarget: number;
   dirty: boolean;
@@ -216,12 +230,23 @@ export default function App() {
         t: 'hipSwivel';
         side: 'L' | 'R';
         sAng: number;
+        rawHip: number;
         hip0: number;
         femur0: number;
         shin0: number;
         foot0: number;
         flipped0: boolean;
+        ankleTarget0: [number, number] | null;
+        footWorldDir0: number | null;
         snap?: PoseIKSnapshot;
+      }
+    | {
+        t: 'persp';
+        what: 'vp' | 'horizon' | 'ground';
+        q0: [number, number];
+        vpX0: number;
+        h0: number;
+        g0: number;
       }
     | {
         t: 'shoulder';
@@ -256,6 +281,8 @@ export default function App() {
     | null
   >(null);
   const ikConfigRef = useRef<IKConfig>({ ...DEFAULT_IK_CONFIG });
+  const perspRef = useRef<PerspectiveState>({ ...PERSP_DEFAULT });
+  const hoverPerspRef = useRef<PerspHandle>(null);
   const ikPinsRef = useRef<Record<string, IKPinEntry>>({});
   const ikOverlayRef = useRef<{
     activeChainIds: string[] | null;
@@ -270,6 +297,7 @@ export default function App() {
   });
   const longIkTimerRef = useRef<number>(0);
   const rightClickRef = useRef<{ count: number; timer: number }>({ count: 0, timer: 0 });
+  const shiftTapRef = useRef<{ down: boolean; used: boolean }>({ down: false, used: false });
   const zCounterRef = useRef(40);
   const jsonEditingRef = useRef(false);
   const benchmarkMsgRef = useRef(false);
@@ -554,12 +582,16 @@ export default function App() {
               actUntil: rt.actUntil,
               bgColor: '#121315',
               wingPop: rt.wingPop,
+              superWings: rt.superWings,
               abcGhosts: buildAbcGhosts(),
               ikOverlay: buildIkOverlay(),
               handRGotz: partMgrRef.current?.inst.handR?.gotz,
               handLGotz: partMgrRef.current?.inst.handL?.gotz,
               handRProps: partMgrRef.current?.inst.handR?.propsModel,
               handLProps: partMgrRef.current?.inst.handL?.propsModel,
+              persp: perspRef.current,
+              hoverPersp: hoverPerspRef.current,
+              draggingPersp: dragRef.current?.t === 'persp' ? dragRef.current.what : null,
             });
           }
         } catch (err) {
@@ -669,6 +701,9 @@ export default function App() {
         bondOn: true,
         constrainLimits: prev?.constrainLimits ?? false,
         prometheusWings: false,
+        superWings: false,
+        ribAnchor: 'upper',
+        skullView: 'front',
         wingPop: 0,
         wingTarget: 0,
         dirty: true,
@@ -686,7 +721,7 @@ export default function App() {
       rtRef.current = rt;
 
       graph.pieces.forEach((p) => {
-        if (p.src && !p.gotzManaged) {
+        if (p.src && !p.gotzManaged && !(withDigitsAndJoints && p.name === 'Handkit')) {
           decImage(p.src)
             .then((bm) => setPieceBitmap(p, bm as CanvasImageSource & { width: number; height: number }, wake))
             .catch((er) => setHudText(`image decode failed: ${er.message}`));
@@ -827,10 +862,12 @@ export default function App() {
         actUntil: 0,
         bgColor: '#121315',
         wingPop: rt.wingPop,
+        superWings: rt.superWings,
         handRGotz: partMgrRef.current?.inst.handR?.gotz,
         handLGotz: partMgrRef.current?.inst.handL?.gotz,
         handRProps: partMgrRef.current?.inst.handR?.propsModel,
         handLProps: partMgrRef.current?.inst.handL?.propsModel,
+        persp: perspRef.current,
       });
     }
     cv.toBlob((b) => {
@@ -1252,9 +1289,18 @@ export default function App() {
     [stopAbcLoop, syncUi, wake],
   );
 
-  // Keyboard shortcuts matching ClaudeBase + ABC capture/loop
+  // Keyboard shortcuts matching ClaudeBase + ABC capture/loop + Shift tap Ribwings
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Shift') {
+        if (!e.repeat) {
+          shiftTapRef.current = { down: true, used: false };
+        }
+        return;
+      }
+      if (shiftTapRef.current.down) {
+        shiftTapRef.current.used = true;
+      }
       if (e.key === 'Escape') {
         setActivePart(null);
         return;
@@ -1267,18 +1313,23 @@ export default function App() {
       if (!tgt) return;
       const step = e.shiftKey ? 5 : 1;
 
-      if (e.key === 'ArrowLeft') {
+      if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        const nextDeg = e.key === 'ArrowLeft' ? tgt.ang - step : tgt.ang + step;
         tgt.ang = clampAnatomicalAngle(
           tgt,
-          clampRealisticShoulder(tgt, tgt.ang - step, rt.by, rt.prometheusWings),
+          clampChungusRibAngle(
+            tgt.id,
+            clampRealisticShoulder(tgt, nextDeg, rt.by, rt.prometheusWings),
+            rt.ribAnchor,
+          ),
           rt.constrainLimits,
         );
-      } else if (e.key === 'ArrowRight') {
-        tgt.ang = clampAnatomicalAngle(
-          tgt,
-          clampRealisticShoulder(tgt, tgt.ang + step, rt.by, rt.prometheusWings),
-          rt.constrainLimits,
-        );
+        if (rt.ribAnchor === 'lower' && (tgt.id === 'ribR' || tgt.id === 'ribL')) {
+          const oppRib = rt.by[tgt.id === 'ribR' ? 'ribL' : 'ribR'];
+          if (oppRib) {
+            oppRib.ang = clampChungusRibAngle(oppRib.id, -tgt.ang, 'lower');
+          }
+        }
       } else if (e.key === ' ') {
         e.preventDefault();
         handleToggleAbcLoop();
@@ -1298,29 +1349,83 @@ export default function App() {
       syncUi();
       wake();
     };
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.key === 'Shift' && shiftTapRef.current.down) {
+        const wasUsed = shiftTapRef.current.used;
+        shiftTapRef.current = { down: false, used: false };
+        if (wasUsed) return;
+        const tag = (document.activeElement as HTMLElement | null)?.tagName || '';
+        if (/TEXTAREA|INPUT|SELECT/.test(tag)) return;
+        const rt = rtRef.current;
+        if (!rt) return;
+        const nextMode: RibAnchorMode = rt.ribAnchor === 'ribwings' ? 'upper' : 'ribwings';
+        rt.ribAnchor = nextMode;
+        applyRibAnchorMode(rt.by, nextMode);
+        window.clearTimeout(copyToastTimerRef.current);
+        setCopyToast(nextMode === 'ribwings' ? 'Rib anchor · Ribwings (Neck)' : 'Rib anchor · Upper Spine');
+        copyToastTimerRef.current = window.setTimeout(() => setCopyToast(null), 1500);
+        syncUi();
+        wake();
+      }
+    };
     window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+    };
   }, [fitCanvas, handleCaptureAbcSlot, handleToggleAbcLoop, syncUi, wake]);
 
-  const openPartForNode = useCallback((node: RigNode) => {
-    const mgr = partMgrRef.current;
-    if (!mgr) return;
-    const I =
-      mgr.inst[node.id] ||
-      (node.parent ? mgr.inst[node.parent] : undefined) ||
-      (node.id.startsWith('thumb') || node.id.startsWith('finger')
-        ? mgr.inst['hand' + (node.id.endsWith('L') ? 'L' : 'R')]
-        : undefined);
-    if (I) {
-      if (I.key === 'hand') {
-        setActivePart(I);
-      } else {
-        mgr.loadPartAssets(I.key).then(() => {
-          setActivePart(I);
-        });
+  const cycleSkullView = useCallback(
+    (explicit?: SkullViewMode) => {
+      const rt = rtRef.current;
+      if (!rt || !rt.by.head) return;
+      const order: SkullViewMode[] = ['front', 'side', 'back'];
+      const next = explicit ?? order[(order.indexOf(rt.skullView) + 1) % order.length];
+      rt.skullView = next;
+      anchorFigureOnPerspectiveShift(
+        rt.nodes,
+        rt.by,
+        rt.root,
+        rt.bondOn,
+        rt.wingPop,
+        ikConfigRef.current.groundY,
+        () => applySkullView(rt.by.head, next, wake),
+      );
+      window.clearTimeout(copyToastTimerRef.current);
+      setCopyToast(`Skull model · ${next.charAt(0).toUpperCase() + next.slice(1)}`);
+      copyToastTimerRef.current = window.setTimeout(() => setCopyToast(null), 1500);
+      syncUi();
+      wake();
+    },
+    [syncUi, wake],
+  );
+
+  const openPartForNode = useCallback(
+    (node: RigNode) => {
+      const mgr = partMgrRef.current;
+      if (!mgr) return;
+      // Head switches between Front, Side & Back skull models (Yorrick deactivated)
+      if (node.id === 'head' || node.id === 'lip' || node.id === 'chinTip') {
+        cycleSkullView();
+        return;
       }
-    }
-  }, []);
+      // Piggy foot sub-rig deactivated for now
+      if (node.id === 'footR' || node.id === 'footL' || node.id === 'toeR' || node.id === 'toeL') {
+        return;
+      }
+      const I =
+        mgr.inst[node.id] ||
+        (node.parent ? mgr.inst[node.parent] : undefined) ||
+        (node.id.startsWith('thumb') || node.id.startsWith('finger')
+          ? mgr.inst['hand' + (node.id.endsWith('L') ? 'L' : 'R')]
+          : undefined);
+      if (I && I.key === 'hand') {
+        setActivePart(I);
+      }
+    },
+    [cycleSkullView],
+  );
 
   const isSwivelId = (id: string) =>
     id === 'swivelL' || id === 'swivelR' || id === 'swivelTipL' || id === 'swivelTipR';
@@ -1377,9 +1482,9 @@ export default function App() {
         sidePoseRef.current = targetSide;
         const dir = targetSide === 'R' ? 1 : -1; // 'R' = facing viewer's right (+X), 'L' = facing viewer's left (-X)
         if (rt.by.hipR) rt.by.hipR.flipX = targetSide === 'R';
-        if (rt.by.femurR) rt.by.femurR.flipX = targetSide === 'R';
+        if (rt.by.femurR) rt.by.femurR.flipX = false;
         if (rt.by.hipL) rt.by.hipL.flipX = targetSide === 'L';
-        if (rt.by.femurL) rt.by.femurL.flipX = targetSide === 'L';
+        if (rt.by.femurL) rt.by.femurL.flipX = false;
 
         // Hips + staggered side-view legs (both knees & feet oriented in profile)
         toAngles.pelvis = dir * 4;
@@ -1456,12 +1561,37 @@ export default function App() {
     q: [number, number],
     rt: RigRuntime,
   ): { node: RigNode; piece: RigPiece | null } | null => {
-    // 1. Primary anatomical joints (excluding swivel & separated hip sockets so sockets pick femurs cleanly)
+    // 0. Prioritize hands clearly over overlapping digit sub-bones so hand activation & drag aren't ambiguous
+    const handPickR = (38 * rt.dpr) / rt.z;
+    for (const hid of ['handR', 'handL'] as const) {
+      const hn = rt.by[hid];
+      if (!hn) continue;
+      const hp = pos(hn, rt.by);
+      if (Math.hypot(hp[0] - q[0], hp[1] - q[1]) < handPickR) {
+        return { node: hn, piece: hn.pieces[0] ?? null };
+      }
+    }
+
+    // 1. Primary anatomical joints with differentiated lumbar pick point (38% up toward thorax) so pelvis [1257,3382] stays unambiguous
     let best: RigNode | null = null;
-    let bd = (22 * rt.dpr) / rt.z;
+    let bd = (20 * rt.dpr) / rt.z;
     for (const n of rt.nodes) {
-      if (isSwivelId(n.id) || n.id === 'hipR' || n.id === 'hipL' || n.id === 'ribR' || n.id === 'ribL') continue;
-      const p = pos(n, rt.by);
+      if (
+        isSwivelId(n.id) ||
+        n.id === 'hipR' ||
+        n.id === 'hipL' ||
+        n.id === 'ribR' ||
+        n.id === 'ribL' ||
+        n.id.startsWith('thumb') ||
+        n.id.startsWith('finger')
+      ) {
+        continue;
+      }
+      let p = pos(n, rt.by);
+      if (n.id === 'lumbar' && rt.by.thorax) {
+        const tp = pos(rt.by.thorax, rt.by);
+        p = [p[0] + (tp[0] - p[0]) * 0.38, p[1] + (tp[1] - p[1]) * 0.38];
+      }
       const d = Math.hypot(p[0] - q[0], p[1] - q[1]);
       if (d < bd) {
         bd = d;
@@ -1471,7 +1601,7 @@ export default function App() {
     if (best) return { node: best, piece: null };
 
     // 2. Pixel hit-test on sprites (defer Shoulderswivel if too close to primary spine/shoulder joints)
-    const hit = hitTestPiece(q, rt.pieces, rt.wingPop);
+    const hit = hitTestPiece(q, rt.pieces, rt.wingPop, rt.superWings);
     if (hit) {
       if (hit.piece.name === 'Shoulderswivel') {
         const minPrimaryDist = (30 * rt.dpr) / rt.z;
@@ -1559,9 +1689,10 @@ export default function App() {
       const endDir0 = getWorldDir(E, tipNode ? tipNode.piv : null, rt.by);
       const uPos = pos(U, rt.by);
       const ePos = pos(E, rt.by);
+      const uMirror = U.w[0] * U.w[3] - U.w[1] * U.w[2] < 0 ? -1 : 1;
       const bendHint =
         Math.abs(L.ang) > 4
-          ? (L.ang > 0 ? 1 : -1) * (U.flipX ? -1 : 1)
+          ? (L.ang > 0 ? 1 : -1) * uMirror
           : chain.id.startsWith('leg')
           ? chain.bendSign
           : U.id === 'humerusL'
@@ -1703,6 +1834,7 @@ export default function App() {
     cv.setPointerCapture(e.pointerId);
 
     if (e.shiftKey || e.button === 1) {
+      shiftTapRef.current.used = true;
       rt.userView = true;
       dragRef.current = { t: 'pan', x: e.clientX, y: e.clientY, ox: rt.ox, oy: rt.oy };
       return;
@@ -1712,7 +1844,37 @@ export default function App() {
     snapSpringRef.current = null;
     solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
     const q = toWorld(e);
+
+    const pPre = hitPerspHandle(q, perspRef.current, { z: rt.z, ox: rt.ox, oy: rt.oy, dpr: rt.dpr });
+    if (pPre === 'vp') {
+      dragRef.current = {
+        t: 'persp',
+        what: 'vp',
+        q0: q,
+        vpX0: perspRef.current.vpX,
+        h0: perspRef.current.horizonY,
+        g0: perspRef.current.groundY,
+      };
+      cv.style.cursor = 'ew-resize';
+      wake();
+      return;
+    }
+
     const picked = pickAtWorldPoint(q, rt);
+    if (!picked && (pPre === 'horizon' || pPre === 'ground')) {
+      dragRef.current = {
+        t: 'persp',
+        what: pPre,
+        q0: q,
+        vpX0: perspRef.current.vpX,
+        h0: perspRef.current.horizonY,
+        g0: perspRef.current.groundY,
+      };
+      cv.style.cursor = 'ns-resize';
+      wake();
+      return;
+    }
+
     if (picked) {
       rt.sel = picked.node;
     }
@@ -1722,7 +1884,7 @@ export default function App() {
     const ikCfg = ikConfigRef.current;
     const allowIk = ikCfg.mode !== 'fk' && !e.altKey;
 
-    // Separated Hip cluster (upper round swivels & chains leg + snaps >10% flip to side view)
+    // Separated Hip cluster (upper hip swivels around spine base; switches >25% beyond lower spine onto opposite leg)
     if (rt.sel.id === 'hipR' || rt.sel.id === 'hipL') {
       const hipSide: 'L' | 'R' = rt.sel.id === 'hipL' ? 'L' : 'R';
       const hipNode = rt.sel;
@@ -1738,25 +1900,42 @@ export default function App() {
           const dx = q[0] - w[4];
           const dy = q[1] - w[5];
           const localY = (-w[1] * dx + w[0] * dy) / det;
-          onUpperRound = localY <= hp.y + hp.h * 0.68;
+          onUpperRound = localY <= hp.y + hp.h * 0.62;
         }
       }
       if (onUpperRound && femur) {
-        const hpPos = pos(hipNode, rt.by);
+        solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
+        const spineBase = pos(rt.by.pelvis ?? rt.root, rt.by);
+        const spineDivInit = rt.by.lumbar?.ang ?? 0;
+        const curSideInit = (hipSide === 'R' ? -1 : 1) * (hipNode.flipX ? -1 : 1);
+        const relInit = normalizeDeg(hipNode.ang - spineDivInit);
+        const outInit = curSideInit === -1 ? relInit : -relInit;
+        let initRaw = hipNode.ang;
+        if (outInit > 76) {
+          const ratio = Math.min(0.985, (outInit - 76) / 16.25);
+          const rawOut = 76 + 16.25 * Math.atanh(ratio);
+          initRaw = spineDivInit + (curSideInit === -1 ? rawOut : -rawOut);
+        }
+        const toeNode = rt.by['toe' + hipSide];
+        const ankleTarget0 = foot ? pos(foot, rt.by) : null;
+        const footWorldDir0 = foot && toeNode ? getWorldDir(foot, toeNode.piv, rt.by) : null;
         dragRef.current = {
           t: 'hipSwivel',
           side: hipSide,
-          sAng: Math.atan2(q[1] - hpPos[1], q[0] - hpPos[0]),
+          sAng: Math.atan2(q[1] - spineBase[1], q[0] - spineBase[0]),
+          rawHip: initRaw,
           hip0: hipNode.ang,
           femur0: femur.ang,
           shin0: shin?.ang ?? 0,
           foot0: foot?.ang ?? 0,
           flipped0: !!hipNode.flipX,
+          ankleTarget0,
+          footWorldDir0,
           snap: allowIk ? capturePoseIKSnapshot(rt.nodes, rt.by, rt.root, rt.bondOn, rt.wingPop) : undefined,
         };
         return;
       }
-      // Lower hip base drives pelvis
+      // Lower hip base drives pelvis weight/squat IK
       rt.sel = rt.root;
     }
 
@@ -1855,11 +2034,23 @@ export default function App() {
     if (!drag) {
       solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
       const q = toWorld(e);
+      const pH = hitPerspHandle(q, perspRef.current, { z: rt.z, ox: rt.ox, oy: rt.oy, dpr: rt.dpr });
+      if (pH === 'vp') {
+        if (hoverPerspRef.current !== 'vp' || rt.hov) {
+          hoverPerspRef.current = 'vp';
+          rt.hov = null;
+          cv.style.cursor = 'ew-resize';
+          repaint();
+        }
+        return;
+      }
       const picked = pickAtWorldPoint(q, rt);
       const best = picked?.node ?? null;
-      if (best !== rt.hov) {
+      const nextPersp: PerspHandle = !best && (pH === 'horizon' || pH === 'ground') ? pH : null;
+      if (best !== rt.hov || nextPersp !== hoverPerspRef.current) {
         rt.hov = best;
-        cv.style.cursor = best ? 'pointer' : 'crosshair';
+        hoverPerspRef.current = nextPersp;
+        cv.style.cursor = nextPersp ? 'ns-resize' : best ? 'pointer' : 'crosshair';
         repaint();
       }
       return;
@@ -1874,6 +2065,20 @@ export default function App() {
     }
 
     const q = toWorld(e);
+    if (drag.t === 'persp') {
+      if (drag.what === 'vp') {
+        perspRef.current.vpX = drag.vpX0 + (q[0] - drag.q0[0]);
+      } else if (drag.what === 'horizon') {
+        perspRef.current.horizonY = Math.max(-1800, Math.min(perspRef.current.groundY + 1200, drag.h0 + (q[1] - drag.q0[1])));
+      } else if (drag.what === 'ground') {
+        perspRef.current.groundY = Math.max(perspRef.current.horizonY - 900, Math.min(rt.H + 1400, drag.g0 + (q[1] - drag.q0[1])));
+        ikConfigRef.current = { ...ikConfigRef.current, groundY: perspRef.current.groundY };
+      }
+      syncUi();
+      wake();
+      return;
+    }
+
     const ikCfg = ikConfigRef.current;
 
     if (drag.t === 'limbIk') {
@@ -2015,23 +2220,100 @@ export default function App() {
       const shin = rt.by['shin' + drag.side];
       const foot = rt.by['foot' + drag.side];
       if (hip && femur) {
-        const hpPos = pos(hip, rt.by);
-        const curAng = Math.atan2(q[1] - hpPos[1], q[0] - hpPos[0]);
-        const dAng = normalizeDeg((curAng - drag.sAng) / DEG);
-        const rawTarget = drag.hip0 + dAng * 0.55;
+        const spineBase = pos(rt.by.pelvis ?? rt.root, rt.by);
+        const curAng = Math.atan2(q[1] - spineBase[1], q[0] - spineBase[0]);
+        const stepDeg = normalizeDeg((curAng - drag.sAng) / DEG);
+        drag.sAng = curAng;
+        drag.rawHip += stepDeg * 0.95;
 
-        // Mostly rigid hip swivel [-12, 12]; >10% (15deg) in other direction snaps & flips leg to side view
-        const flipThresh = 15;
-        if (Math.abs(dAng) > flipThresh) {
-          const nextFlip = !drag.flipped0;
+        // Lower spine dividing angle in pelvis-local space (the dividing line in all poses)
+        const spineDivDeg = rt.by.lumbar?.ang ?? 0;
+        const homeSide = drag.side === 'R' ? -1 : 1;
+        const curSide = homeSide * (hip.flipX ? -1 : 1);
+
+        // Positive outwardDeg swings leg outward toward 90° horizontal; positive inwardDeg crosses the lower spine
+        const relToSpine = drag.rawHip - spineDivDeg;
+        const outwardDeg = curSide === -1 ? relToSpine : -relToSpine;
+        const inwardDeg = -outwardDeg;
+        const femOutwardSign = drag.side === 'R' ? 1 : -1;
+
+        const easeStart = 76;
+        const maxOutward = 92.25;
+        const headroom = maxOutward - easeStart;
+
+        const legChain = LIMB_CHAINS.find((c) => c.id === 'leg' + drag.side);
+        const toeNode = rt.by['toe' + drag.side];
+        const weightyIkCfg = { ...ikCfg, solver: 'analytical' as const, softness: 0.02 };
+
+        const applyGroundedWeightiness = (target: [number, number] | null) => {
+          if (!legChain || !target) return;
+          femur.ang = drag.femur0;
+          if (shin) shin.ang = drag.shin0;
+          solveAnalyticalLimbIK(
+            legChain,
+            target,
+            rt.nodes,
+            rt.by,
+            rt.bondOn,
+            rt.wingPop,
+            weightyIkCfg,
+            false,
+            legChain.bendSign,
+          );
+          if (foot && toeNode && drag.footWorldDir0 !== null) {
+            solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
+            setWorldDirExact(foot, toeNode.piv, drag.footWorldDir0, rt.by);
+          }
+        };
+
+        const computeAnkleTargetBeforeShift = (): [number, number] | null => {
+          solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
+          const anNode = foot ?? shin;
+          if (!anNode) return null;
+          const feB = pos(femur, rt.by);
+          const anB = pos(anNode, rt.by);
+          const dy = anB[1] - feB[1];
+          const gy = perspRef.current.groundY;
+          if (dy > 40 && gy > feB[1] + 40) {
+            const t = (gy - feB[1]) / dy;
+            return [feB[0] + t * (anB[0] - feB[0]), gy];
+          }
+          return anB;
+        };
+
+        const snapFemurToAnkleTarget = (target: [number, number] | null) => {
+          const anNode = foot ?? shin;
+          if (!target || !anNode) return;
+          solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
+          const feA = pos(femur, rt.by);
+          const anA = pos(anNode, rt.by);
+          const curDir = Math.atan2(anA[1] - feA[1], anA[0] - feA[0]);
+          const tgtDir = Math.atan2(target[1] - feA[1], target[0] - feA[0]);
+          const hw = hip.w;
+          const detSign = hw[0] * hw[3] - hw[1] * hw[2] < 0 ? -1 : 1;
+          const deltaDeg = normalizeDeg((tgtDir - curDir) / DEG);
+          femur.ang = normalizeDeg(femur.ang + deltaDeg * detSign);
+        };
+
+        // 1. Inward crossing past lower spine (>25% = 45°): shift hip & compensate leg to keep ankle on same ground spot
+        if (inwardDeg > 45) {
+          const groundSpot = drag.ankleTarget0 ?? computeAnkleTargetBeforeShift();
+          const nextFlip = !hip.flipX;
+          const oppSide: 'L' | 'R' = drag.side === 'R' ? 'L' : 'R';
+          const oppHip = rt.by['hip' + oppSide];
+
           hip.flipX = nextFlip;
-          femur.flipX = nextFlip;
-          hip.ang = nextFlip ? (drag.side === 'R' ? 8 : -8) : 0;
-          femur.ang = nextFlip ? (drag.side === 'R' ? 10 : -10) : 0;
-          if (shin) shin.ang = nextFlip ? (drag.side === 'R' ? -10 : 10) : 0;
-          if (foot) foot.ang = nextFlip ? (drag.side === 'R' ? 6 : -6) : 0;
+          femur.flipX = false;
 
-          drag.sAng = curAng;
+          const sameVisualSideAsOpp = Boolean(nextFlip) !== Boolean(oppHip?.flipX);
+          if (oppHip && sameVisualSideAsOpp) {
+            hip.ang = oppHip.ang;
+          } else {
+            hip.ang = oppHip ? normalizeDeg(2 * spineDivDeg - oppHip.ang) : spineDivDeg;
+          }
+          applyGroundedWeightiness(groundSpot);
+
+          drag.rawHip = hip.ang;
           drag.hip0 = hip.ang;
           drag.femur0 = femur.ang;
           drag.shin0 = shin?.ang ?? 0;
@@ -2040,18 +2322,90 @@ export default function App() {
 
           window.clearTimeout(copyToastTimerRef.current);
           setCopyToast(
-            `${drag.side === 'R' ? 'Right' : 'Left'} hip snapped · ${nextFlip ? 'side view leg flip' : 'front view'}`,
+            `${drag.side === 'R' ? 'Right' : 'Left'} hip · shifted & weighted to ankle ground spot`,
           );
           copyToastTimerRef.current = window.setTimeout(() => setCopyToast(null), 1600);
         } else {
-          hip.ang = Math.max(-12, Math.min(12, rawTarget));
-          const deltaHip = hip.ang - drag.hip0;
-          // Coordinated hip-to-leg chain reaction while swiveling
-          femur.ang = clampAnatomicalAngle(femur, drag.femur0 + deltaHip * 0.65, rt.constrainLimits);
-          const shinSign = femur.flipX ? -1 : 1;
-          if (shin) shin.ang = clampAnatomicalAngle(shin, drag.shin0 - deltaHip * 0.4 * shinSign, rt.constrainLimits);
-          if (foot) foot.ang = clampAnatomicalAngle(foot, drag.foot0 + deltaHip * 0.2 * shinSign, rt.constrainLimits);
+          // 2. Outward hip eases into ~92.25° while femur & shin compensate for grounded weightiness, then lifts past upper spine
+          let easedHipOutward = outwardDeg;
+          let carryToFemur = 0;
+          if (outwardDeg > easeStart) {
+            easedHipOutward = easeStart + headroom * Math.tanh((outwardDeg - easeStart) / headroom);
+            carryToFemur = outwardDeg - easedHipOutward;
+          }
+          const finalRel = curSide === -1 ? easedHipOutward : -easedHipOutward;
+          hip.ang = normalizeDeg(spineDivDeg + finalRel);
+
+          // Grounded 2-bone weighty compensation keeps ankle at drag.ankleTarget0
+          applyGroundedWeightiness(drag.ankleTarget0);
+
+          if (carryToFemur > 0) {
+            const femGrounded = femur.ang;
+            const shinGrounded = shin?.ang ?? drag.shin0;
+            const footGrounded = foot?.ang ?? drag.foot0;
+            const liftT = Math.min(1, carryToFemur / 42);
+            const smoothT = liftT * liftT * (3 - 2 * liftT);
+            const targetUp = drag.femur0 + femOutwardSign * carryToFemur;
+            const upDelta =
+              femOutwardSign === 1
+                ? (((targetUp - femGrounded) % 360) + 360) % 360
+                : -((((femGrounded - targetUp) % 360) + 360) % 360);
+            femur.ang = normalizeDeg(femGrounded + upDelta * smoothT);
+            if (shin) {
+              shin.ang = normalizeDeg(
+                shinGrounded * (1 - smoothT) + drag.shin0 * smoothT - femOutwardSign * 16 * Math.sin(Math.PI * smoothT),
+              );
+            }
+            if (foot) {
+              foot.ang = normalizeDeg(footGrounded + normalizeDeg(drag.foot0 - footGrounded) * smoothT);
+            }
+          }
+
+          // Check if femur has continued upward past the upper spine (thorax -> neck); if so, switch hip cleanly
+          if (outwardDeg > 135 && shin && rt.by.thorax && rt.by.neck) {
+            solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
+            const th = pos(rt.by.thorax, rt.by);
+            const nk = pos(rt.by.neck, rt.by);
+            const fe = pos(femur, rt.by);
+            const shBefore = pos(shin, rt.by);
+            const spDx = nk[0] - th[0];
+            const spDy = nk[1] - th[1];
+            const spLen = Math.hypot(spDx, spDy) || 1;
+            const ux = spDx / spLen;
+            const uy = spDy / spLen;
+            const nx = -uy;
+            const ny = ux;
+            const alongSpine = (shBefore[0] - th[0]) * ux + (shBefore[1] - th[1]) * uy;
+            const kneeLat = (shBefore[0] - th[0]) * nx + (shBefore[1] - th[1]) * ny;
+            const femAng = Math.atan2(shBefore[1] - fe[1], shBefore[0] - fe[0]);
+            const spineAng = Math.atan2(spDy, spDx);
+            const femPastSpine = normalizeDeg((femAng - spineAng) / DEG) * -curSide;
+
+            if (alongSpine > 200 && femPastSpine > 6 && kneeLat * -curSide > 35) {
+              const ankleTarget = computeAnkleTargetBeforeShift();
+              const nextFlip = !hip.flipX;
+              const newCurSide = homeSide * (nextFlip ? -1 : 1);
+              hip.flipX = nextFlip;
+              femur.flipX = false;
+              hip.ang = normalizeDeg(2 * spineDivDeg - hip.ang);
+              snapFemurToAnkleTarget(ankleTarget);
+
+              const rawCarry = (femur.ang - drag.femur0) * femOutwardSign;
+              const newCarry = Math.max(0, rawCarry < -90 ? rawCarry + 360 : rawCarry);
+              const newTotalOut = easedHipOutward + newCarry;
+              drag.rawHip = spineDivDeg + (newCurSide === -1 ? newTotalOut : -newTotalOut);
+              drag.hip0 = hip.ang;
+              drag.flipped0 = nextFlip;
+
+              window.clearTimeout(copyToastTimerRef.current);
+              setCopyToast(
+                `${drag.side === 'R' ? 'Right' : 'Left'} hip · switched past upper spine`,
+              );
+              copyToastTimerRef.current = window.setTimeout(() => setCopyToast(null), 1600);
+            }
+          }
         }
+
         if (ikCfg.mode !== 'fk') {
           applyBalanceAndPins(
             hip.id,
@@ -2063,6 +2417,7 @@ export default function App() {
             ikCfg,
             ikPinsRef.current,
             rt.constrainLimits,
+            'leg' + drag.side,
           );
         }
         syncUi();
@@ -2244,9 +2599,19 @@ export default function App() {
 
     rt.sel.ang = clampAnatomicalAngle(
       rt.sel,
-      clampRealisticShoulder(rt.sel, rawIntent, rt.by, rt.prometheusWings),
+      clampChungusRibAngle(
+        rt.sel.id,
+        clampRealisticShoulder(rt.sel, rawIntent, rt.by, rt.prometheusWings),
+        rt.ribAnchor,
+      ),
       rt.constrainLimits,
     );
+    if (rt.ribAnchor === 'lower' && (rt.sel.id === 'ribR' || rt.sel.id === 'ribL')) {
+      const oppRib = rt.by[rt.sel.id === 'ribR' ? 'ribL' : 'ribR'];
+      if (oppRib) {
+        oppRib.ang = clampChungusRibAngle(oppRib.id, -rt.sel.ang, 'lower');
+      }
+    }
     if (ikCfg.mode !== 'fk') {
       applyBalanceAndPins(
         rt.sel.id,
@@ -2266,6 +2631,7 @@ export default function App() {
 
   const handleCanvasPointerUp = () => {
     clearLongIkTimer();
+    const prevDrag = dragRef.current;
     dragRef.current = null;
     ikOverlayRef.current = {
       activeChainIds: null,
@@ -2273,8 +2639,14 @@ export default function App() {
       holdProgress: null,
       holdPos: null,
     };
+    const rt = rtRef.current;
+    if (prevDrag?.t === 'persp' && prevDrag.what === 'ground' && rt && ikConfigRef.current.footGravity) {
+      enforceGroundContact(rt.nodes, rt.by, rt.root, rt.bondOn, rt.wingPop, ikConfigRef.current.groundY, false);
+    }
     if (canvasRef.current) {
-      canvasRef.current.style.cursor = rtRef.current?.hov ? 'pointer' : 'crosshair';
+      const hp = hoverPerspRef.current;
+      canvasRef.current.style.cursor =
+        hp === 'vp' ? 'ew-resize' : hp ? 'ns-resize' : rt?.hov ? 'pointer' : 'crosshair';
     }
     syncAllPinsToRig();
     syncUi();
@@ -2297,35 +2669,99 @@ export default function App() {
     wake();
   };
 
+  const isNearWing = (q: [number, number], rt: RigRuntime): RigNode | null => {
+    const wingHitR = (34 * rt.dpr) / rt.z;
+    for (const id of ['wingL', 'wingR'] as const) {
+      const wn = rt.by[id];
+      if (!wn) continue;
+      const wp = pos(wn, rt.by);
+      if (Math.hypot(wp[0] - q[0], wp[1] - q[1]) <= wingHitR) return wn;
+    }
+    const pieceHit = hitTestPiece(q, rt.pieces, rt.wingPop, rt.superWings);
+    if (pieceHit?.piece.name === 'Backshoulder') {
+      return rt.by[pieceHit.node.id === 'braceL' ? 'wingL' : 'wingR'] ?? pieceHit.node;
+    }
+    return null;
+  };
+
+  const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (e.detail !== 3) return;
+    const rt = rtRef.current;
+    if (!rt) return;
+    solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
+    const q = toWorld(e);
+    const wn = isNearWing(q, rt);
+    if (wn) {
+      rt.superWings = !rt.superWings;
+      rt.prometheusWings = true;
+      rt.wingTarget = 1;
+      rt.sel = wn;
+      sortPiecesForWings(rt.pieces, true);
+      window.clearTimeout(copyToastTimerRef.current);
+      setCopyToast(rt.superWings ? 'Super Prometheus Wings (5×)' : 'Prometheus Wings (1×)');
+      copyToastTimerRef.current = window.setTimeout(() => setCopyToast(null), 1800);
+      syncUi();
+      wake();
+    }
+  };
+
   const handleCanvasDoubleClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const rt = rtRef.current;
     if (!rt) return;
     solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
     const q = toWorld(e);
-    const wingHitR = (26 * rt.dpr) / rt.z;
-    for (const id of ['wingL', 'wingR'] as const) {
-      const wn = rt.by[id];
-      if (!wn) continue;
-      const wp = pos(wn, rt.by);
-      if (Math.hypot(wp[0] - q[0], wp[1] - q[1]) <= wingHitR) {
-        rt.prometheusWings = !rt.prometheusWings;
-        rt.wingTarget = rt.prometheusWings ? 1 : 0;
-        rt.sel = wn;
-        sortPiecesForWings(rt.pieces, rt.prometheusWings);
-        if (!rt.prometheusWings) {
-          rt.nodes.forEach((n) => {
-            n.ang = clampRealisticShoulder(n, n.ang, rt.by, false);
-          });
-        }
-        window.clearTimeout(copyToastTimerRef.current);
-        setCopyToast(rt.prometheusWings ? 'Prometheus wings popped out' : 'Prometheus wings tucked');
-        copyToastTimerRef.current = window.setTimeout(() => setCopyToast(null), 1600);
+
+    // 1. Wing toggle (2x click pops/tucks 1x wings; 3x click in handleCanvasClick toggles 5x Super Prometheus Wings)
+    const wn = isNearWing(q, rt);
+    if (wn) {
+      rt.prometheusWings = !rt.prometheusWings;
+      if (!rt.prometheusWings) rt.superWings = false;
+      rt.wingTarget = rt.prometheusWings ? 1 : 0;
+      rt.sel = wn;
+      sortPiecesForWings(rt.pieces, rt.prometheusWings);
+      if (rt.ribAnchor === 'lower') {
+        applyChungusChestCavity(rt.by, rt.prometheusWings);
+      }
+      if (!rt.prometheusWings) {
+        rt.nodes.forEach((n) => {
+          n.ang = clampRealisticShoulder(n, n.ang, rt.by, false);
+        });
+      }
+      window.clearTimeout(copyToastTimerRef.current);
+      setCopyToast(
+        rt.prometheusWings
+          ? rt.ribAnchor === 'lower'
+            ? 'Prometheus wings + Chungus chest cavity active'
+            : 'Prometheus wings popped out'
+          : 'Prometheus wings tucked',
+      );
+      copyToastTimerRef.current = window.setTimeout(() => setCopyToast(null), 1600);
+      syncUi();
+      wake();
+      return;
+    }
+
+    // 2. Generous hand proximity check so double-clicking around wrist or palm reliably opens Gotz Hand Editor
+    const handProxR = (78 * rt.dpr) / rt.z;
+    for (const s of ['R', 'L'] as const) {
+      const hn = rt.by['hand' + s];
+      if (!hn) continue;
+      const wp = pos(hn, rt.by);
+      const ft = rt.by['fingerTip' + s];
+      const palm = ft ? pos(ft, rt.by) : [wp[0], wp[1] + 400];
+      const mx = (wp[0] + palm[0]) * 0.5;
+      const my = (wp[1] + palm[1]) * 0.5;
+      if (Math.hypot(wp[0] - q[0], wp[1] - q[1]) <= handProxR || Math.hypot(mx - q[0], my - q[1]) <= handProxR * 1.45) {
+        rt.sel = hn;
+        openPartForNode(hn);
         syncUi();
         wake();
         return;
       }
     }
-    const hit = hitTest(q, rt.pieces, rt.wingPop);
+
+    // 3. Fallback sprite pixel hit-test
+    const hit = hitTest(q, rt.pieces, rt.wingPop, rt.superWings);
     if (hit) openPartForNode(hit);
   };
 
@@ -2368,10 +2804,12 @@ export default function App() {
   const canEditSelectedPart = !!(
     rt &&
     partMgrRef.current &&
-    (partMgrRef.current.inst[rt.sel.id] ||
-      (rt.sel.parent && partMgrRef.current.inst[rt.sel.parent]) ||
-      ((rt.sel.id.startsWith('thumb') || rt.sel.id.startsWith('finger')) &&
-        partMgrRef.current.inst['hand' + (rt.sel.id.endsWith('L') ? 'L' : 'R')]))
+    (rt.sel.id === 'handR' ||
+      rt.sel.id === 'handL' ||
+      rt.sel.parent === 'handR' ||
+      rt.sel.parent === 'handL' ||
+      rt.sel.id.startsWith('thumb') ||
+      rt.sel.id.startsWith('finger'))
   );
   const selectedHandInst =
     rt && partMgrRef.current
@@ -2381,6 +2819,15 @@ export default function App() {
         ? partMgrRef.current.inst.handL
         : undefined
       : undefined;
+
+  const activeHandScreenAngleDeg = (() => {
+    if (!activePart || activePart.key !== 'hand' || !rt) return undefined;
+    const hn = rt.by[activePart.id];
+    if (!hn) return undefined;
+    solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
+    const w = hn.w;
+    return Math.round(normalizeDeg(Math.atan2(w[1], w[0]) / DEG + 180) * 10) / 10;
+  })();
 
   // Trigger re-read whenever uiTick advances
   void uiTick;
@@ -2412,6 +2859,29 @@ export default function App() {
               bondStatus={bondStatus}
               canEditPart={canEditSelectedPart}
               ikMode={ikConfigRef.current.mode}
+              ribAnchorMode={rt?.ribAnchor ?? 'upper'}
+              onRibAnchorModeChange={(nextMode) => {
+                if (!rt) return;
+                const prevMode = rt.ribAnchor;
+                if (prevMode === 'lower' && nextMode !== 'lower') {
+                  applyChungusChestCavity(rt.by, false);
+                }
+                rt.ribAnchor = nextMode;
+                applyRibAnchorMode(rt.by, nextMode);
+                if (nextMode === 'lower') {
+                  rt.prometheusWings = true;
+                  rt.wingTarget = 1;
+                  sortPiecesForWings(rt.pieces, true);
+                  applyChungusChestCavity(rt.by, true);
+                  window.clearTimeout(copyToastTimerRef.current);
+                  setCopyToast('Chungus Swing · Chest cavity + Prometheus wings');
+                  copyToastTimerRef.current = window.setTimeout(() => setCopyToast(null), 1700);
+                }
+                syncUi();
+                wake();
+              }}
+              skullView={rt?.skullView ?? 'front'}
+              onSkullViewChange={(view) => cycleSkullView(view)}
               gotzPoseCode={selectedHandInst?.gotz ? getGotzPoseCode(selectedHandInst.gotz) : undefined}
               onQuickGotzPreset={
                 selectedHandInst?.gotz
@@ -2431,9 +2901,19 @@ export default function App() {
                 if (!rt || !tgt) return;
                 tgt.ang = clampAnatomicalAngle(
                   tgt,
-                  clampRealisticShoulder(tgt, deg, rt.by, rt.prometheusWings),
+                  clampChungusRibAngle(
+                    tgt.id,
+                    clampRealisticShoulder(tgt, deg, rt.by, rt.prometheusWings),
+                    rt.ribAnchor,
+                  ),
                   rt.constrainLimits,
                 );
+                if (rt.ribAnchor === 'lower' && (tgt.id === 'ribR' || tgt.id === 'ribL')) {
+                  const oppRib = rt.by[tgt.id === 'ribR' ? 'ribL' : 'ribR'];
+                  if (oppRib) {
+                    oppRib.ang = clampChungusRibAngle(oppRib.id, -tgt.ang, 'lower');
+                  }
+                }
                 syncUi();
                 wake();
               }}
@@ -2464,8 +2944,12 @@ export default function App() {
               onTogglePrometheusWings={(v) => {
                 if (!rt) return;
                 rt.prometheusWings = v;
+                if (!v) rt.superWings = false;
                 rt.wingTarget = v ? 1 : 0;
                 sortPiecesForWings(rt.pieces, v);
+                if (rt.ribAnchor === 'lower') {
+                  applyChungusChestCavity(rt.by, v);
+                }
                 if (!v) {
                   rt.nodes.forEach((n) => {
                     n.ang = clampRealisticShoulder(n, n.ang, rt.by, false);
@@ -2493,6 +2977,12 @@ export default function App() {
                 if (!rt || !partMgrRef.current) return;
                 snapSpringRef.current = null;
                 sidePoseRef.current = null;
+                rt.superWings = false;
+                rt.prometheusWings = false;
+                rt.wingTarget = 0;
+                rt.ribAnchor = 'upper';
+                rt.skullView = 'front';
+                if (rt.by.head) applySkullView(rt.by.head, 'front', wake);
                 for (const partId in partMgrRef.current.inst) {
                   partMgrRef.current.inst[partId].reset();
                 }
@@ -2501,8 +2991,11 @@ export default function App() {
                   n.flipX = false;
                   n.piv = n.rest.slice() as [number, number];
                 });
+                applyRibAnchorMode(rt.by, 'upper');
                 rt.root.tx = 0;
                 rt.root.ty = 0;
+                perspRef.current = { ...PERSP_DEFAULT, enabled: perspRef.current.enabled };
+                ikConfigRef.current = { ...ikConfigRef.current, groundY: PERSP_DEFAULT.groundY };
                 ikPinsRef.current = syncPinsFromRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, {});
                 syncUi();
                 wake();
@@ -2551,6 +3044,23 @@ export default function App() {
             <IKPanel
               config={ikConfigRef.current}
               pins={ikPinsRef.current}
+              persp={perspRef.current}
+              onTogglePersp={(enabled) => {
+                perspRef.current = { ...perspRef.current, enabled };
+                if (!enabled) hoverPerspRef.current = null;
+                syncUi();
+                wake();
+              }}
+              onResetPersp={() => {
+                perspRef.current = { ...PERSP_DEFAULT, enabled: true };
+                ikConfigRef.current = { ...ikConfigRef.current, groundY: PERSP_DEFAULT.groundY };
+                if (rt && ikConfigRef.current.footGravity) {
+                  enforceGroundContact(rt.nodes, rt.by, rt.root, rt.bondOn, rt.wingPop, ikConfigRef.current.groundY, false);
+                  syncAllPinsToRig();
+                }
+                syncUi();
+                wake();
+              }}
               onUpdateConfig={handleUpdateIkConfig}
               onTogglePin={(effectorId) => {
                 if (!rt) return;
@@ -2636,6 +3146,7 @@ export default function App() {
               }}
               onResetIkDefaults={() => {
                 ikConfigRef.current = { ...DEFAULT_IK_CONFIG };
+                perspRef.current = { ...PERSP_DEFAULT, enabled: perspRef.current.enabled };
                 const cleared: Record<string, IKPinEntry> = {};
                 for (const k of Object.keys(ikPinsRef.current)) {
                   cleared[k] = { ...ikPinsRef.current[k], pinned: false };
@@ -2868,6 +3379,7 @@ export default function App() {
         ikMode={ikConfigRef.current.mode}
         showBones={rt?.showBones ?? true}
         showGuides={rt?.showGuides ?? false}
+        showPersp={perspRef.current.enabled}
         onTogglePanel={togglePanel}
         onModeChange={(m) => {
           if (!rt) return;
@@ -2886,6 +3398,12 @@ export default function App() {
         onToggleGuides={(v) => {
           if (!rt) return;
           rt.showGuides = v;
+          syncUi();
+          wake();
+        }}
+        onTogglePersp={(v) => {
+          perspRef.current = { ...perspRef.current, enabled: v };
+          if (!v) hoverPerspRef.current = null;
           syncUi();
           wake();
         }}
@@ -2910,13 +3428,14 @@ export default function App() {
             onPointerUp={handleCanvasPointerUp}
             onPointerCancel={handleCanvasPointerUp}
             onPointerLeave={() => {
-              if (rtRef.current?.hov) {
-                rtRef.current.hov = null;
-                if (canvasRef.current) canvasRef.current.style.cursor = 'crosshair';
-                repaint();
-              }
+              const changed = !!(rtRef.current?.hov || hoverPerspRef.current);
+              if (rtRef.current) rtRef.current.hov = null;
+              hoverPerspRef.current = null;
+              if (canvasRef.current) canvasRef.current.style.cursor = 'crosshair';
+              if (changed) repaint();
             }}
             onWheel={handleCanvasWheel}
+            onClick={handleCanvasClick}
             onDoubleClick={handleCanvasDoubleClick}
             onContextMenu={handleContextMenu}
             className="block h-full w-full max-h-full max-w-full touch-none cursor-crosshair"
@@ -3076,9 +3595,10 @@ export default function App() {
         </div>
       )}
 
-      {/* Hierarchical Part Rig Modal (Yorrick / Gotz / Piggy) */}
+      {/* Hierarchical Gotz Hand Rig Modal (Yorrick & Piggy deactivated; skull cycles Front/Side/Back) */}
       <PartRigModal
         part={activePart}
+        screenAngleDeg={activeHandScreenAngleDeg}
         onClose={() => setActivePart(null)}
         onMutated={(part) => {
           const rt = rtRef.current;

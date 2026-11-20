@@ -186,7 +186,7 @@ export const GOTZ_PRESETS: Record<string, GotzHandPresetData> = {
     thumb: 6,
     fs: { index: 0, ring: 2, pinky: 5 },
     rot: {
-      thumb: 68.54034649493677,
+      thumb: -6,
       index: 18.085173986193276,
       middle: 8.53075642630238,
       ring: 5.530756426302371,
@@ -641,7 +641,7 @@ function traceGotzBoneCanvas(
 
 /**
  * Renders the articulated 5-digit Gotz Hand Rig v2 directly onto a high-DPI offscreen canvas
- * matching Bitruvius Puppyt's black cutout + purple bone contour palette (#000000 + #5a10d8),
+ * matching Bitruvius Puppyt's black cutout + purple bone contour palette (#000000 + #5d03b4),
  * with wrist hub placed cleanly at (halfW, topPad) and digits pointing downward (+Y).
  */
 export function bakeGotzHandToCanvas(
@@ -675,7 +675,7 @@ export function bakeGotzHandToCanvas(
     g.moveTo(0, 0);
     for (const [mx, my] of metaHeads) g.lineTo(mx, my);
     g.closePath();
-    g.fillStyle = '#5a10d8';
+    g.fillStyle = '#5d03b4';
     g.fill();
     g.lineWidth = 0.08;
     g.strokeStyle = '#000000';
@@ -694,7 +694,7 @@ export function bakeGotzHandToCanvas(
       g.translate(seg.x1, seg.y1);
       g.rotate(seg.ang);
       traceGotzBoneCanvas(g, seg.len, i, segs.length, wMul, st.style);
-      g.fillStyle = '#5a10d8';
+      g.fillStyle = '#5d03b4';
       g.fill();
       g.lineWidth = 0.085;
       g.lineJoin = 'round';
@@ -718,7 +718,7 @@ export function bakeGotzHandToCanvas(
       const isTip = j === pts.length - 1;
       g.beginPath();
       g.arc(px, py, isTip ? 0.11 : 0.085, 0, Math.PI * 2);
-      g.fillStyle = isTip ? '#3b1c6e' : '#181024';
+      g.fillStyle = isTip ? '#3e0278' : '#181024';
       g.fill();
       g.lineWidth = 0.035;
       g.strokeStyle = '#000000';
@@ -729,7 +729,7 @@ export function bakeGotzHandToCanvas(
   // Carpal / wrist socket disc
   g.beginPath();
   g.arc(0, 0, 0.34, 0, Math.PI * 2);
-  g.fillStyle = '#5a10d8';
+  g.fillStyle = '#5d03b4';
   g.fill();
   g.lineWidth = 0.085;
   g.strokeStyle = '#000000';

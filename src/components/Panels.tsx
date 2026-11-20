@@ -1,8 +1,9 @@
 import React, { useMemo, useRef, useState } from 'react';
-import { getTensionRatio, toPure360 } from '../engine/fkEngine';
+import { getTensionRatio, toPure360, type RibAnchorMode } from '../engine/fkEngine';
 import { EFFECTOR_IDS, IK_MODE_LABELS } from '../engine/ikEngine';
 import { ABC_SLOTS, FPS_PRESETS, getFilledAbcSlots, sampleMotionCurvePath } from '../engine/motionEngine';
 import { GITHUB_ROADMAP, LIMB_CHAINS } from '../engine/rigMetadata';
+import type { SkullViewMode } from '../engine/skullKitModels';
 import type {
   AbcLoopMode,
   AbcSerializedState,
@@ -15,6 +16,7 @@ import type {
   IKTriggerMode,
   MotionFeel,
   MotionSettings,
+  PerspectiveState,
   RigNode,
   SavedPoseEntry,
 } from '../engine/types';
@@ -41,6 +43,10 @@ interface PosePanelProps {
   ikMode?: IKMode;
   gotzPoseCode?: string;
   onQuickGotzPreset?: (preset: string) => void;
+  ribAnchorMode?: RibAnchorMode;
+  onRibAnchorModeChange?: (mode: RibAnchorMode) => void;
+  skullView?: SkullViewMode;
+  onSkullViewChange?: (view: SkullViewMode) => void;
 }
 
 export const PosePanel: React.FC<PosePanelProps> = ({
@@ -65,6 +71,10 @@ export const PosePanel: React.FC<PosePanelProps> = ({
   ikMode = 'fluid',
   gotzPoseCode,
   onQuickGotzPreset,
+  ribAnchorMode = 'upper',
+  onRibAnchorModeChange,
+  skullView = 'front',
+  onSkullViewChange,
 }) => {
   const curAngle = target ? Math.round(target.ang) : 0;
   const tension = target ? getTensionRatio(target) : { ratio: 0, nearLimit: false, atLimit: false };
@@ -77,6 +87,7 @@ export const PosePanel: React.FC<PosePanelProps> = ({
       selected.parent?.startsWith('thumb') ||
       selected.parent?.startsWith('finger'))
   );
+  const isHeadSel = !!(selected && (selected.id === 'head' || selected.id === 'lip' || selected.id === 'chinTip'));
 
   return (
     <div className="space-y-2.5">
@@ -202,7 +213,11 @@ export const PosePanel: React.FC<PosePanelProps> = ({
           </div>
         ))}
         {prometheusWings && (
-          <div className="text-[#c084fc]">prometheus wings · popped out (rigid)</div>
+          <div className="text-[#c084fc]">
+            {ribAnchorMode === 'lower'
+              ? 'chungus swing · chest cavity + prometheus wings'
+              : 'prometheus wings · popped out (rigid)'}
+          </div>
         )}
         {(tension.nearLimit || tension.atLimit) && (
           <div className="text-[#ff3b6b]">
@@ -210,6 +225,62 @@ export const PosePanel: React.FC<PosePanelProps> = ({
           </div>
         )}
       </div>
+
+      {onRibAnchorModeChange && (
+        <div className="space-y-1 border-t border-[#2b2f36] pt-2">
+          <div className="flex items-center justify-between text-[10.5px]">
+            <span className="font-semibold text-[#8b919c] uppercase">Rib Anchor</span>
+            <span className="text-[#8b919c]">Shift tap: Ribwings</span>
+          </div>
+          <div className="grid grid-cols-3 gap-1">
+            {(
+              [
+                ['upper', 'Upper Spine'],
+                ['lower', 'Chungus Swing'],
+                ['ribwings', 'Ribwings'],
+              ] as const
+            ).map(([m, label]) => (
+              <button
+                key={m}
+                type="button"
+                onClick={() => onRibAnchorModeChange(m)}
+                className={`rounded border px-1.5 py-1 text-[10.5px] font-medium transition-colors ${
+                  ribAnchorMode === m
+                    ? 'border-[#a855f7] bg-[#a855f7]/25 text-[#e9d5ff]'
+                    : 'border-[#2b2f36] bg-[#121315] text-[#c7cbd3] hover:border-[#a855f7]/60 hover:text-white'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {onSkullViewChange && (isHeadSel || skullView !== 'front') && (
+        <div className="space-y-1 border-t border-[#2b2f36] pt-2">
+          <div className="flex items-center justify-between text-[10.5px]">
+            <span className="font-semibold text-[#8b919c] uppercase">Skull Model</span>
+            <span className="text-[#8b919c]">2× click head</span>
+          </div>
+          <div className="grid grid-cols-3 gap-1">
+            {(['front', 'side', 'back'] as const).map((v) => (
+              <button
+                key={v}
+                type="button"
+                onClick={() => onSkullViewChange(v)}
+                className={`rounded border px-1.5 py-1 text-[10.5px] font-medium capitalize transition-colors ${
+                  skullView === v
+                    ? 'border-[#10b981] bg-[#10b981]/20 text-[#34d399]'
+                    : 'border-[#2b2f36] bg-[#121315] text-[#c7cbd3] hover:border-[#10b981]/60 hover:text-white'
+                }`}
+              >
+                {v}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
 
       {isHandSel && gotzPoseCode && onQuickGotzPreset && (
         <div className="space-y-1.5 border-t border-[#2b2f36] pt-2">
@@ -1607,6 +1678,9 @@ export const AboutPanel: React.FC = () => {
 interface IKPanelProps {
   config: IKConfig;
   pins: Record<string, IKPinEntry>;
+  persp?: PerspectiveState;
+  onTogglePersp?: (enabled: boolean) => void;
+  onResetPersp?: () => void;
   onUpdateConfig: (patch: Partial<IKConfig>) => void;
   onTogglePin: (effectorId: string) => void;
   onSyncPins: () => void;
@@ -1627,6 +1701,9 @@ const EFFECTOR_SHORT_LABELS: Record<string, string> = {
 export const IKPanel: React.FC<IKPanelProps> = ({
   config,
   pins,
+  persp,
+  onTogglePersp,
+  onResetPersp,
   onUpdateConfig,
   onTogglePin,
   onSyncPins,
@@ -1885,6 +1962,35 @@ export const IKPanel: React.FC<IKPanelProps> = ({
           <span>Allow elastic reach stretch past max span</span>
         </label>
       </div>
+
+      {/* Horizon & 1-Point Perspective System */}
+      {persp && onTogglePersp && onResetPersp && (
+        <div className="space-y-1.5 border-t border-[#2b2f36] pt-2.5">
+          <div className="flex items-center justify-between gap-2">
+            <label className="flex cursor-pointer items-center gap-1.5 text-[11.5px] text-[#c7cbd3]">
+              <input
+                type="checkbox"
+                checked={persp.enabled}
+                onChange={(e) => onTogglePersp(e.target.checked)}
+                className="accent-[#a855f7]"
+              />
+              <span>Horizon &amp; Perspective Grid</span>
+            </label>
+            <button
+              type="button"
+              onClick={onResetPersp}
+              className="rounded border border-[#2b2f36] bg-[#121315] px-2 py-0.5 text-[10.5px] text-[#c7cbd3] hover:border-[#a855f7] hover:text-white"
+            >
+              Reset VP
+            </button>
+          </div>
+          <div className="font-mono-tabular flex flex-wrap gap-x-3 gap-y-0.5 text-[10.5px] text-[#8b919c]">
+            <span>VP X: {Math.round(persp.vpX)}</span>
+            <span>Horizon Y: {Math.round(persp.horizonY)}</span>
+            <span>Ground Y: {Math.round(persp.groundY)}</span>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

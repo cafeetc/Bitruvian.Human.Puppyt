@@ -46,6 +46,16 @@ export interface IKOverlayState {
   holdPos: [number, number] | null;
 }
 
+export interface PerspectiveState {
+  enabled: boolean;
+  groundY: number;
+  horizonY: number;
+  vpX: number;
+  floorScale: number;
+}
+
+export type PerspHandle = 'vp' | 'horizon' | 'ground' | null;
+
 export interface AimConstraint {
   to: string;
   from: [number, number];

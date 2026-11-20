@@ -13,12 +13,22 @@ import type {
   IKMode,
   IKPinEntry,
   LimbChainDef,
+  PerspHandle,
+  PerspectiveState,
   RigNode,
 } from './types';
 
 export const DEFAULT_GROUND_Y = 7013.5;
 export const GROUND_TOL = 32;
 export const LONG_IK_MS = 260;
+
+export const PERSP_DEFAULT: PerspectiveState = {
+  enabled: true,
+  groundY: DEFAULT_GROUND_Y,
+  horizonY: 3170,
+  vpX: 1257,
+  floorScale: 420,
+};
 
 export const DEFAULT_IK_CONFIG: IKConfig = {
   mode: 'fluid',
@@ -120,8 +130,8 @@ function resolveBendSign(
   c: LimbChainDef,
   U: RigNode,
   L: RigNode,
-  tx: number,
-  P1: [number, number],
+  _tx: number,
+  _P1: [number, number],
   config: IKConfig,
   bendHint = 0,
 ): number {
@@ -131,11 +141,7 @@ function resolveBendSign(
   if (Math.abs(L.ang) > 4) {
     return (L.ang > 0 ? 1 : -1) * (U.flipX ? -1 : 1);
   }
-  if (c.id.startsWith('leg')) {
-    return c.bendSign;
-  }
-  // Arms naturally fold inward/upward depending on target side relative to shoulder
-  return U.id === 'humerusL' ? (tx < P1[0] ? 1 : -1) : tx > P1[0] ? -1 : 1;
+  return c.bendSign;
 }
 
 /**
@@ -231,6 +237,7 @@ export function solveFABRIKChain(
     clampEachStep?: boolean;
     allowRootShift?: boolean;
     rootShiftWeight?: number;
+    rootNode?: RigNode;
   },
 ): void {
   const chain: RigNode[] = [];
@@ -274,12 +281,12 @@ export function solveFABRIKChain(
     }
   }
 
-  // Nudge middle joints subtly toward poleBias if chain is nearly straight so FABRIK never deadlocks collinearly
+  // Nudge middle joints toward anatomical poleBias so FABRIK bends in natural direction even from straight rest
   if (opts?.poleBias && nCount >= 3) {
     const [pbx, pby] = opts.poleBias;
     for (let i = 1; i < nCount - 1; i++) {
-      pts[i][0] += pbx * 18;
-      pts[i][1] += pby * 18;
+      pts[i][0] += pbx * 64;
+      pts[i][1] += pby * 64;
     }
   }
 
@@ -336,11 +343,12 @@ export function solveFABRIKChain(
   }
 
   // Convert solved world points sequentially into local joint angles
-  if (opts?.allowRootShift && chain[0] && !chain[0].parent) {
+  const shiftTarget = opts?.rootNode ?? (chain[0] && !chain[0].parent ? chain[0] : null);
+  if (opts?.allowRootShift && shiftTarget) {
     const dxRoot = pts[0][0] - rootOrigin[0];
     const dyRoot = pts[0][1] - rootOrigin[1];
-    chain[0].tx += dxRoot;
-    chain[0].ty += dyRoot;
+    shiftTarget.tx += dxRoot;
+    shiftTarget.ty += dyRoot;
     solveRig(nodes, by, bondOn, wingPop);
   }
 
@@ -388,18 +396,20 @@ export function solveLimbChain(
     return;
   }
 
-  // Compute pole bias perpendicular to root -> target vector for natural anatomical bending
+  // Compute anatomical perpendicular pole bias matching analytical -bs * alpha convention (+Y down => (vy, -vx))
   solveRig(nodes, by, bondOn, wingPop);
   const pRoot = pos(U, by);
   const vx = target[0] - pRoot[0];
   const vy = target[1] - pRoot[1];
   const dist = Math.hypot(vx, vy) || 1;
-  const perpX = -vy / dist;
-  const perpY = vx / dist;
+  const perpX = vy / dist;
+  const perpY = -vx / dist;
   const bs = resolveBendSign(c, U, L, target[0], U.piv, config, bendHint);
 
-  // If leg is flipped horizontally, invert pole perpendicular sign accordingly
-  const flipMul = U.flipX ? -1 : 1;
+  // Account for horizontal mirroring on either limb U or ancestor hip (hipR/hipL flipX)
+  const par = parentOf(U, by);
+  const pDet = par ? par.w[0] * par.w[3] - par.w[1] * par.w[2] : 1;
+  const flipMul = (U.flipX ? -1 : 1) * (pDet < 0 ? -1 : 1);
   const pole: [number, number] = [perpX * bs * flipMul, perpY * bs * flipMul];
 
   solveFABRIKChain(
@@ -466,6 +476,82 @@ export function enforceGroundContact(
     return true;
   }
   return false;
+}
+
+/**
+ * Anchors perspective focal X strictly to the figure root so moving a single limb (like a leg)
+ * never shifts the perspective grid unless the whole model translates.
+ */
+export function skelFocalX(by: Record<string, RigNode>, root?: RigNode): number {
+  return root ? pos(root, by)[0] : 1257;
+}
+
+/**
+ * Hit-tests the 1-point perspective handles: vanishing point dot first, then horizon and ground lines.
+ */
+export function hitPerspHandle(
+  q: [number, number],
+  persp: PerspectiveState,
+  cam: { z: number; ox: number; oy: number; dpr: number },
+): PerspHandle {
+  if (!persp.enabled) return null;
+  const tol = (11 * cam.dpr) / Math.max(0.001, cam.z);
+  const sx = q[0] * cam.z + cam.ox;
+  const sy = q[1] * cam.z + cam.oy;
+  const vpx = persp.vpX * cam.z + cam.ox;
+  const vpy = persp.horizonY * cam.z + cam.oy;
+  if (Math.hypot(sx - vpx, sy - vpy) <= 13 * cam.dpr) return 'vp';
+  if (Math.abs(q[1] - persp.horizonY) <= tol) return 'horizon';
+  if (Math.abs(q[1] - persp.groundY) <= tol * 1.15) return 'ground';
+  return null;
+}
+
+/**
+ * Preserves planted lowest foot contact position across view/turnaround shifts.
+ */
+export function anchorFigureOnPerspectiveShift(
+  nodes: RigNode[],
+  by: Record<string, RigNode>,
+  root: RigNode,
+  bondOn: boolean,
+  wingPop: number,
+  groundY: number,
+  fn: () => void,
+): void {
+  if (!by.footL || !by.footR) {
+    fn();
+    return;
+  }
+  solveRig(nodes, by, bondOn, wingPop);
+  const onL = isFootOnGround('footL', by, groundY);
+  const onR = isFootOnGround('footR', by, groundY);
+  let anchorId: 'footL' | 'footR' = 'footL';
+  if (onL && onR) {
+    anchorId = Math.abs(pos(by.footL, by)[0] - 1257) <= Math.abs(pos(by.footR, by)[0] - 1257) ? 'footL' : 'footR';
+  } else if (onL) {
+    anchorId = 'footL';
+  } else if (onR) {
+    anchorId = 'footR';
+  } else {
+    const yL = footContactInfo(by.footL, by).maxY;
+    const yR = footContactInfo(by.footR, by).maxY;
+    anchorId = yL >= yR ? 'footL' : 'footR';
+  }
+  const fNode = by[anchorId];
+  const p0 = pos(fNode, by);
+  const prevMaxY = footContactInfo(fNode, by).maxY;
+
+  fn();
+
+  solveRig(nodes, by, bondOn, wingPop);
+  const p1 = pos(fNode, by);
+  const info1 = footContactInfo(fNode, by);
+  root.tx += p0[0] - p1[0];
+  root.ty += prevMaxY - info1.maxY;
+  solveRig(nodes, by, bondOn, wingPop);
+  if (onL || onR) {
+    enforceGroundContact(nodes, by, root, bondOn, wingPop, groundY, false);
+  }
 }
 
 export function syncPinsFromRig(
@@ -737,6 +823,7 @@ export function clampPelvisToPlantedFeet(
 export interface FBIKDragBaseline {
   fbNodeId: string;
   q0: [number, number];
+  fbPos0: [number, number];
   nodeAngs: Record<string, number>;
   rootTx: number;
   rootTy: number;
@@ -747,6 +834,58 @@ export interface FBIKDragBaseline {
   headDir0: number;
   shinDir0: number;
   footDir0: number;
+}
+
+function solveGroundedOrGravityLegs(
+  pullBiasX: number,
+  base: FBIKDragBaseline,
+  nodes: RigNode[],
+  by: Record<string, RigNode>,
+  root: RigNode,
+  bondOn: boolean,
+  wingPop: number,
+  config: IKConfig,
+  constrainLimits: boolean,
+): void {
+  solveRig(nodes, by, bondOn, wingPop);
+
+  if (base.wasGrounded) {
+    clampPelvisToPlantedFeet(base.plantL, base.plantR, pullBiasX, nodes, by, root, bondOn, wingPop, config.groundY);
+    if (base.plantL) {
+      solveLimbChain(LIMB_CHAINS[2], base.plantL.pos, nodes, by, bondOn, wingPop, config, constrainLimits, 1);
+      if (by.footL && by.toeL) setWorldDirExact(by.footL, by.toeL.piv, base.plantL.endDir, by);
+    }
+    if (base.plantR) {
+      solveLimbChain(LIMB_CHAINS[3], base.plantR.pos, nodes, by, bondOn, wingPop, config, constrainLimits, -1);
+      if (by.footR && by.toeR) setWorldDirExact(by.footR, by.toeR.piv, base.plantR.endDir, by);
+    }
+    enforceGroundContact(nodes, by, root, bondOn, wingPop, config.groundY, false);
+    return;
+  }
+
+  if (config.footGravity) {
+    // Even if feet started in the air, if lowering pelvis touches groundY, bend knees naturally instead of penetrating floor
+    const fL = by.footL;
+    const fR = by.footR;
+    const pL = fL ? pos(fL, by) : null;
+    const pR = fR ? pos(fR, by) : null;
+    const hitL = !!(pL && pL[1] >= config.groundY - 4);
+    const hitR = !!(pR && pR[1] >= config.groundY - 4);
+    if (hitL || hitR) {
+      const tempL: IKPinEntry | null = hitL && pL ? { pos: [pL[0], config.groundY], endDir: base.snap.limbs.legL?.Edir ?? 0, pinned: true } : null;
+      const tempR: IKPinEntry | null = hitR && pR ? { pos: [pR[0], config.groundY], endDir: base.snap.limbs.legR?.Edir ?? 0, pinned: true } : null;
+      clampPelvisToPlantedFeet(tempL, tempR, pullBiasX, nodes, by, root, bondOn, wingPop, config.groundY);
+      if (tempL) {
+        solveLimbChain(LIMB_CHAINS[2], tempL.pos, nodes, by, bondOn, wingPop, config, constrainLimits, 1);
+        if (by.footL && by.toeL) setWorldDirExact(by.footL, by.toeL.piv, tempL.endDir, by);
+      }
+      if (tempR) {
+        solveLimbChain(LIMB_CHAINS[3], tempR.pos, nodes, by, bondOn, wingPop, config, constrainLimits, -1);
+        if (by.footR && by.toeR) setWorldDirExact(by.footR, by.toeR.piv, tempR.endDir, by);
+      }
+    }
+    enforceGroundContact(nodes, by, root, bondOn, wingPop, config.groundY, false);
+  }
 }
 
 export function captureFBIKBaseline(
@@ -801,6 +940,7 @@ export function captureFBIKBaseline(
   return {
     fbNodeId: fbNode.id,
     q0: [q0[0], q0[1]],
+    fbPos0: pos(fbNode, by),
     nodeAngs,
     rootTx: root.tx,
     rootTy: root.ty,
@@ -838,22 +978,40 @@ export function solveFullBodyIKDrag(
   const dx = q[0] - base.q0[0];
   const dy = q[1] - base.q0[1];
 
-  // 1. Pelvis Drag: translate root while preserving pinned/grounded legs & hands
+  // 1. Pelvis Drag: translate root while knees flex naturally on grounded/pinned feet (never snapping sideways)
   if (fnId === 'pelvis') {
     root.tx += dx;
     root.ty += dy;
-    if (base.wasGrounded) {
-      root.ang = clampAnatomicalAngle(
-        root,
-        (base.nodeAngs.pelvis ?? 0) + Math.max(-14, Math.min(14, dx * 0.01)),
-        constrainLimits,
-      );
-      clampPelvisToPlantedFeet(base.plantL, base.plantR, q[0], nodes, by, root, bondOn, wingPop, config.groundY);
-    } else if (config.footGravity) {
-      enforceGroundContact(nodes, by, root, bondOn, wingPop, config.groundY, false);
-    }
+    root.ang = clampAnatomicalAngle(
+      root,
+      (base.nodeAngs.pelvis ?? 0) + Math.max(-10, Math.min(10, dx * 0.008)),
+      constrainLimits,
+    );
+    solveGroundedOrGravityLegs(q[0], base, nodes, by, root, bondOn, wingPop, config, constrainLimits);
     applyBalanceAndPins('pelvis', base.snap, nodes, by, bondOn, wingPop, config, pins, constrainLimits);
     return ['pelvis', 'femurL', 'shinL', 'footL', 'femurR', 'shinR', 'footR'];
+  }
+
+  // 1b. Lumbar Drag (directly above hips): shift weight & lean spine cleanly WITHOUT 0-length pelvis->lumbar 90deg snap
+  if (fnId === 'lumbar') {
+    const lu = by.lumbar;
+    if (lu && !lu.lock) {
+      lu.ang = clampAnatomicalAngle(
+        lu,
+        (base.nodeAngs.lumbar ?? 0) + Math.max(-36, Math.min(36, dx * 0.028)),
+        constrainLimits,
+      );
+    }
+    root.tx += dx * 0.72;
+    root.ty += dy * 0.85;
+    root.ang = clampAnatomicalAngle(
+      root,
+      (base.nodeAngs.pelvis ?? 0) + Math.max(-8, Math.min(8, dx * 0.005)),
+      constrainLimits,
+    );
+    solveGroundedOrGravityLegs(q[0], base, nodes, by, root, bondOn, wingPop, config, constrainLimits);
+    applyBalanceAndPins('pelvis', base.snap, nodes, by, bondOn, wingPop, config, pins, constrainLimits);
+    return ['pelvis', 'lumbar', 'femurL', 'shinL', 'footL', 'femurR', 'shinR', 'footR'];
   }
 
   // 2. Knee Drag (shinL / shinR): orient thigh toward knee target while keeping foot planted if grounded
@@ -937,38 +1095,25 @@ export function solveFullBodyIKDrag(
     return [cDrag.upper, cDrag.lower, cDrag.effector];
   }
 
-  // 3. Spine / Head FABRIK Chain Drag (head -> neck -> thorax -> lumbar -> pelvis)
+  // 3. Spine / Head FABRIK Chain Drag starting at lumbar (excludes 0-length pelvis->lumbar segment)
+  // Uses delta from initial joint position so starting IK anywhere above the hips never jumps sideways
   const spineChain =
     fnId === 'head'
-      ? ['pelvis', 'lumbar', 'thorax', 'neck', 'head']
+      ? ['lumbar', 'thorax', 'neck', 'head']
       : fnId === 'neck'
-      ? ['pelvis', 'lumbar', 'thorax', 'neck']
-      : fnId === 'thorax'
-      ? ['pelvis', 'lumbar', 'thorax']
-      : ['pelvis', 'lumbar'];
+      ? ['lumbar', 'thorax', 'neck']
+      : ['lumbar', 'thorax'];
 
+  const fbTarget: [number, number] = [base.fbPos0[0] + dx, base.fbPos0[1] + dy];
   const shiftWeight = Math.max(0.05, Math.min(0.65, 1 - config.spineStiffness * 0.75));
-  solveFABRIKChain(spineChain, q, nodes, by, bondOn, wingPop, config, constrainLimits, {
+  solveFABRIKChain(spineChain, fbTarget, nodes, by, bondOn, wingPop, config, constrainLimits, {
     softDamp: false,
     allowRootShift: true,
     rootShiftWeight: shiftWeight,
+    rootNode: root,
   });
 
-  if (base.wasGrounded) {
-    clampPelvisToPlantedFeet(base.plantL, base.plantR, q[0], nodes, by, root, bondOn, wingPop, config.groundY);
-    if (base.plantL) {
-      solveLimbChain(LIMB_CHAINS[2], base.plantL.pos, nodes, by, bondOn, wingPop, config, constrainLimits);
-      if (by.footL && by.toeL) setWorldDirExact(by.footL, by.toeL.piv, base.plantL.endDir, by);
-    }
-    if (base.plantR) {
-      solveLimbChain(LIMB_CHAINS[3], base.plantR.pos, nodes, by, bondOn, wingPop, config, constrainLimits);
-      if (by.footR && by.toeR) setWorldDirExact(by.footR, by.toeR.piv, base.plantR.endDir, by);
-    }
-    enforceGroundContact(nodes, by, root, bondOn, wingPop, config.groundY, false);
-  } else if (config.footGravity) {
-    enforceGroundContact(nodes, by, root, bondOn, wingPop, config.groundY, false);
-  }
-
+  solveGroundedOrGravityLegs(fbTarget[0], base, nodes, by, root, bondOn, wingPop, config, constrainLimits);
   applyBalanceAndPins('thorax', base.snap, nodes, by, bondOn, wingPop, config, pins, constrainLimits);
   solveRig(nodes, by, bondOn, wingPop);
   return spineChain;

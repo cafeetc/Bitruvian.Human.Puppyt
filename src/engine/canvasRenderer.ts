@@ -8,8 +8,8 @@ import {
   gotzToPuppetOffset,
   solveGotzHand,
 } from './gotzHandEngine';
-import { EFFECTOR_IDS, FBIK_CHAIN_NODES, findLimbChainForNode } from './ikEngine';
-import type { AbcPoseRecord, AbcSlot, IKOverlayState, RenderMode, RigNode, RigPiece } from './types';
+import { EFFECTOR_IDS, FBIK_CHAIN_NODES, findLimbChainForNode, footContactInfo, skelFocalX } from './ikEngine';
+import type { AbcPoseRecord, AbcSlot, IKOverlayState, PerspHandle, PerspectiveState, RenderMode, RigNode, RigPiece } from './types';
 
 const GREEN = '#22c55e';
 const RED = '#ef4444';
@@ -67,6 +67,9 @@ export interface RenderContextState {
   handLGotz?: GotzHandState;
   handRProps?: 'anat' | 'leg';
   handLProps?: 'anat' | 'leg';
+  persp?: PerspectiveState;
+  hoverPersp?: PerspHandle;
+  draggingPersp?: PerspHandle;
 }
 
 /**
@@ -564,6 +567,172 @@ export class StageRenderer {
     ctx.setLineDash([]);
   }
 
+  private drawPerspectiveSystem(state: RenderContextState) {
+    const persp = state.persp;
+    if (!persp || !persp.enabled) return;
+    const { ctx, cv, by, nodes, z, ox, oy, dpr, hoverPersp, draggingPersp } = state;
+    const root = nodes.find((n) => !n.parent) || nodes[0];
+    const xMin = -ox / z - 300;
+    const xMax = (cv.width - ox) / z + 300;
+    const yMin = -oy / z - 300;
+    const yMax = (cv.height - oy) / z + 300;
+    const vx = persp.vpX;
+    const vy = persp.horizonY;
+    const gy = persp.groundY;
+    const fx = skelFocalX(by, root);
+    const dHG = gy - vy;
+    const safeHG = Math.abs(dHG) < 18 ? (dHG >= 0 ? 18 : -18) : dHG;
+    const cell = persp.floorScale;
+    const raysN = 7;
+
+    const toScreen = (wx: number, wy: number): [number, number] => [wx * z + ox, wy * z + oy];
+
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+
+    // 1. Subtle purple 1-point perspective floor rays converging to VP, anchored on skeleton focal X
+    const halfSpan = raysN * cell;
+    for (let i = -raysN; i <= raysN; i++) {
+      const gx = fx + i * cell;
+      const dx = gx - vx;
+      const dy = safeHG;
+      const tEnd =
+        dHG >= 0
+          ? Math.max(1.8, (yMax - vy) / (dy || 1))
+          : Math.max(1.8, (vy - yMin) / (Math.abs(dy) || 1));
+      const ex = vx + dx * Math.min(8, tEnd);
+      const ey = vy + dy * Math.min(8, tEnd);
+      const [sx0, sy0] = toScreen(vx, vy);
+      const [sx1, sy1] = toScreen(ex, ey);
+      const isCore = Math.abs(i) <= 1;
+      ctx.beginPath();
+      ctx.moveTo(sx0, sy0);
+      ctx.lineTo(sx1, sy1);
+      ctx.strokeStyle = isCore ? 'rgba(168, 85, 247, 0.25)' : 'rgba(168, 85, 247, 0.12)';
+      ctx.lineWidth = (isCore ? 1.15 : 0.85) * dpr;
+      ctx.stroke();
+    }
+
+    // 2. Depth transversals projected along (groundY - horizonY) including foreground feet depth
+    const kSteps = [-0.42, -0.28, -0.15, 0, 0.35, 0.85, 1.55, 2.55, 4.0, 6.2, 9.5, 15.0];
+    for (const k of kSteps) {
+      if (Math.abs(k) < 0.01) continue; // k = 0 is the main ground line
+      const yk = vy + safeHG / (1 + k * 0.55);
+      const ykScreen = yk * z + oy;
+      if (ykScreen < -40 || ykScreen > cv.height + 40) continue;
+      const scale = (yk - vy) / safeHG;
+      if (scale <= 0.02) continue;
+      const xl = vx + (fx - halfSpan - vx) * scale;
+      const xr = vx + (fx + halfSpan - vx) * scale;
+      const [sxL, syL] = toScreen(xl, yk);
+      const [sxR, syR] = toScreen(xr, yk);
+      ctx.beginPath();
+      ctx.moveTo(sxL, syL);
+      ctx.lineTo(sxR, syR);
+      ctx.strokeStyle =
+        k < 0
+          ? 'rgba(168, 85, 247, 0.17)'
+          : `rgba(168, 85, 247, ${(0.2 / (1 + k * 0.18)).toFixed(3)})`;
+      ctx.lineWidth = 0.85 * dpr;
+      ctx.stroke();
+    }
+
+    // 3. Skeleton focal plumb & sightline tying skeleton center -> ground anchor -> vanishing point
+    const [skx, sky] = toScreen(fx, root ? pos(root, by)[1] : (vy + gy) * 0.5);
+    const [fgx, fgy] = toScreen(fx, gy);
+    const [vpx, vpy] = toScreen(vx, vy);
+    ctx.save();
+    ctx.setLineDash([3 * dpr, 5 * dpr]);
+    ctx.strokeStyle = 'rgba(192, 132, 252, 0.28)';
+    ctx.lineWidth = 1.0 * dpr;
+    ctx.beginPath();
+    ctx.moveTo(skx, sky);
+    ctx.lineTo(fgx, fgy);
+    ctx.lineTo(vpx, vpy);
+    ctx.stroke();
+    ctx.restore();
+
+    // 4. Subtle foot contact ground ellipses when feet rest on/near groundY
+    for (const fid of ['footL', 'footR'] as const) {
+      const f = by[fid];
+      if (!f) continue;
+      const sole = footContactInfo(f, by);
+      const gap = Math.abs(gy - sole.maxY);
+      if (gap < 480) {
+        const alpha = Math.max(0, 1 - gap / 480) * 0.28;
+        const rx = Math.max(12 * dpr, 210 * z * (1 - gap / 700));
+        const [cx_, cy_] = toScreen(sole.midX, gy);
+        ctx.beginPath();
+        ctx.ellipse(cx_, cy_, rx, Math.max(2.5 * dpr, rx * 0.14), 0, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(168, 85, 247, ${alpha.toFixed(3)})`;
+        ctx.fill();
+      }
+    }
+
+    // 5. Firmer GROUND line
+    const gHot = hoverPersp === 'ground' || draggingPersp === 'ground';
+    const [gxL, gyS] = toScreen(xMin, gy);
+    const [gxR] = toScreen(xMax, gy);
+    ctx.save();
+    if (gHot) {
+      ctx.shadowColor = 'rgba(34, 197, 94, 0.88)';
+      ctx.shadowBlur = 10 * dpr;
+    }
+    ctx.beginPath();
+    ctx.moveTo(gxL, gyS);
+    ctx.lineTo(gxR, gyS);
+    ctx.strokeStyle = gHot ? GREEN : 'rgba(168, 85, 247, 0.56)';
+    ctx.lineWidth = (gHot ? 2.4 : 1.55) * dpr;
+    ctx.stroke();
+    ctx.restore();
+
+    // 6. Thinner HORIZON line
+    const hHot = hoverPersp === 'horizon' || draggingPersp === 'horizon';
+    const [hxL, hyS] = toScreen(xMin, vy);
+    const [hxR] = toScreen(xMax, vy);
+    ctx.save();
+    if (hHot) {
+      ctx.shadowColor = 'rgba(34, 197, 94, 0.88)';
+      ctx.shadowBlur = 10 * dpr;
+    }
+    ctx.beginPath();
+    ctx.moveTo(hxL, hyS);
+    ctx.lineTo(hxR, hyS);
+    ctx.strokeStyle = hHot ? GREEN : 'rgba(192, 132, 252, 0.42)';
+    ctx.lineWidth = (hHot ? 1.65 : 0.85) * dpr;
+    ctx.stroke();
+    ctx.restore();
+
+    // 7. Single slideable perspective vanishing point on the horizon line
+    const vpHot = hoverPersp === 'vp' || draggingPersp === 'vp';
+    ctx.save();
+    if (vpHot) {
+      ctx.shadowColor = 'rgba(34, 197, 94, 0.95)';
+      ctx.shadowBlur = 14 * dpr;
+    }
+    ctx.beginPath();
+    ctx.arc(vpx, vpy, (vpHot ? 8.5 : 6.0) * dpr, 0, Math.PI * 2);
+    ctx.fillStyle = vpHot ? 'rgba(34, 197, 94, 0.28)' : 'rgba(168, 85, 247, 0.22)';
+    ctx.fill();
+    ctx.strokeStyle = vpHot ? GREEN : 'rgba(192, 132, 252, 0.78)';
+    ctx.lineWidth = 1.35 * dpr;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(vpx, vpy, 2.4 * dpr, 0, Math.PI * 2);
+    ctx.fillStyle = vpHot ? GREEN : 'rgba(216, 180, 254, 0.9)';
+    ctx.fill();
+    ctx.restore();
+
+    // 8. Micro architectural edge labels
+    ctx.font = `${Math.round(10 * dpr)}px "JetBrains Mono", monospace`;
+    ctx.fillStyle = hHot ? '#34d399' : 'rgba(192, 132, 252, 0.68)';
+    ctx.fillText('HORIZON', 10 * dpr, Math.max(12 * dpr, hyS - 4 * dpr));
+    ctx.fillStyle = gHot ? '#34d399' : 'rgba(192, 132, 252, 0.74)';
+    ctx.fillText('GROUND', 10 * dpr, Math.min(cv.height - 6 * dpr, gyS - 5 * dpr));
+
+    ctx.restore();
+  }
+
   private drawAbcGhosts(state: RenderContextState) {
     const ghosts = state.abcGhosts;
     if (!ghosts || !ghosts.length) return;
@@ -1039,6 +1208,7 @@ export class StageRenderer {
     ctx.fillStyle = state.bgColor;
     ctx.fillRect(0, 0, w, h);
 
+    this.drawPerspectiveSystem(state);
     this.drawAbcGhosts(state);
 
     if (mode === 'A') {
@@ -1121,8 +1291,8 @@ export class StageRenderer {
     ctx.save();
     ctx.setTransform(1, 0, 0, 1, 0, 0);
 
-    // 1. Subtle Floor Line at groundY when Foot Gravity is active
-    if (ik.footGravity) {
+    // 1. Fallback subtle Floor Line at groundY when Foot Gravity is active & Perspective Grid is hidden
+    if (ik.footGravity && !state.persp?.enabled) {
       const gy = ik.groundY * z + oy;
       if (gy >= 0 && gy <= cv.height) {
         ctx.strokeStyle = 'rgba(16, 185, 129, 0.25)';

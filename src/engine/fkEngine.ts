@@ -176,9 +176,12 @@ export function addJoints(def: RawRigDef): void {
       const sorted = map.pelvis.pieces.slice().sort((a, b) => a.x - b.x);
       map.pelvis.pieces = [];
       def.nodes.push(
-        { id: 'hipR', name: 'Right hip', parent: 'pelvis', pivot: [990, 3598], pieces: [sorted[0]] },
-        { id: 'hipL', name: 'Left hip', parent: 'pelvis', pivot: [1521, 3598], pieces: [sorted[1]] },
+        // Hips flip & rotate at the rotate point at the bottom of the spine [1257, 3382]
+        { id: 'hipR', name: 'Right hip', parent: 'pelvis', pivot: [1257, 3382], pieces: [sorted[0]] },
+        { id: 'hipL', name: 'Left hip', parent: 'pelvis', pivot: [1257, 3382], pieces: [sorted[1]] },
       );
+      map.femurR.parent = 'hipR';
+      map.femurL.parent = 'hipL';
     }
   }
 
@@ -188,8 +191,9 @@ export function addJoints(def: RawRigDef): void {
       map.thorax.pieces = map.thorax.pieces.filter((p) => p.name !== 'Ribcage');
       map.thorax.bar = ['ribR', 'ribL'];
       def.nodes.push(
-        { id: 'ribR', name: 'Right ribcage', parent: 'thorax', pivot: [1215, 1327], pieces: [ribs[0]] },
-        { id: 'ribL', name: 'Left ribcage', parent: 'thorax', pivot: [1299, 1271], pieces: [ribs[1]] },
+        // Default rib origin shares rotational origin with upper spine / shoulder swivel [1257.5, 2377.5]
+        { id: 'ribR', name: 'Right ribcage', parent: 'thorax', pivot: [1257.5, 2377.5], pieces: [ribs[0]] },
+        { id: 'ribL', name: 'Left ribcage', parent: 'thorax', pivot: [1257.5, 2377.5], pieces: [ribs[1]] },
       );
     }
   }
@@ -221,6 +225,78 @@ export function addJoints(def: RawRigDef): void {
       pieces: [],
       lock: 1,
     });
+  }
+}
+
+export type RibAnchorMode = 'upper' | 'lower' | 'ribwings';
+
+/**
+ * Safe rotational bounds for ribR/ribL in Chungus Swing ('lower' spine pivot) so
+ * the inner rib border stays anchored against the spine (1168..1349) and never stresses or detaches.
+ */
+export function clampChungusRibAngle(id: string, deg: number, mode: RibAnchorMode): number {
+  const norm = normalizeDeg(deg);
+  if (mode !== 'lower') return norm;
+  if (id === 'ribR') return Math.max(-6.3, Math.min(2, norm));
+  if (id === 'ribL') return Math.max(-2, Math.min(6.3, norm));
+  return norm;
+}
+
+/**
+ * Sets ribR & ribL rotational origins between:
+ *  - 'upper' (default): shares rotational origin with upper spine & shoulder swivel [1257.5, 2377.5]
+ *  - 'lower': Chungus Swing — shares rotational origin with lower spine [1257, 3382]
+ *  - 'ribwings': neck anchor [1215, 1327] / [1299, 1271]
+ */
+export function applyRibAnchorMode(by: Record<string, RigNode>, mode: RibAnchorMode): void {
+  const ribR = by.ribR;
+  const ribL = by.ribL;
+  if (!ribR || !ribL) return;
+  if (mode === 'upper') {
+    const th = by.thorax;
+    const px = th ? th.rest[0] : 1257.5;
+    const py = th ? th.rest[1] : 2377.5;
+    ribR.piv = [px, py];
+    ribR.rest = [px, py];
+    ribL.piv = [px, py];
+    ribL.rest = [px, py];
+  } else if (mode === 'lower') {
+    const lu = by.lumbar ?? by.pelvis;
+    const px = lu ? lu.rest[0] : 1257;
+    const py = lu ? lu.rest[1] : 3382;
+    ribR.piv = [px, py];
+    ribR.rest = [px, py];
+    ribL.piv = [px, py];
+    ribL.rest = [px, py];
+    ribR.ang = clampChungusRibAngle('ribR', ribR.ang, 'lower');
+    ribL.ang = clampChungusRibAngle('ribL', ribL.ang, 'lower');
+  } else {
+    ribR.piv = [1215, 1327];
+    ribR.rest = [1215, 1327];
+    ribL.piv = [1299, 1271];
+    ribL.rest = [1299, 1271];
+  }
+}
+
+/**
+ * Opens or closes the muscular chest cavity between ribR/ribL when Chungus Swing is paired
+ * with Prometheus wings, keeping shoulders & ribs safely aligned inside anatomical bounds.
+ */
+export function applyChungusChestCavity(by: Record<string, RigNode>, openCavity: boolean): void {
+  const ribR = by.ribR;
+  const ribL = by.ribL;
+  if (ribR && ribL) {
+    if (openCavity) {
+      ribR.ang = clampChungusRibAngle('ribR', Math.min(ribR.ang, -5.5), 'lower');
+      ribL.ang = clampChungusRibAngle('ribL', Math.max(ribL.ang, 5.5), 'lower');
+    } else {
+      ribR.ang = 0;
+      ribL.ang = 0;
+    }
+  }
+  if (openCavity) {
+    if (by.swivelR) by.swivelR.ang = Math.max(-14, Math.min(by.swivelR.ang, -7));
+    if (by.swivelL) by.swivelL.ang = Math.min(14, Math.max(by.swivelL.ang, 7));
   }
 }
 
@@ -291,9 +367,6 @@ export function clampRealisticShoulder(
   prometheusWings: boolean,
 ): number {
   const norm = normalizeDeg(deg);
-  if (n.id === 'hipR' || n.id === 'hipL') {
-    return Math.max(-12, Math.min(12, norm));
-  }
   if (prometheusWings) return norm;
   if (n.id === 'braceL' || n.id === 'braceR') {
     return Math.max(-12, Math.min(12, norm));
@@ -539,7 +612,6 @@ export function getBondStatus(nodes: RigNode[], bondOn: boolean): BondStatusItem
 export function assetTips(nodes: RigNode[]): void {
   for (const n of nodes) {
     n.at = null;
-    if (!n.pieces.length || n.aim || n.bar || nodes.some((k) => k.parent === n.id)) continue;
     if (n.id === 'hipR') {
       n.at = [825, 3115];
       continue;
@@ -556,6 +628,7 @@ export function assetTips(nodes: RigNode[]): void {
       n.at = [1808, 2592];
       continue;
     }
+    if (!n.pieces.length || n.aim || n.bar || nodes.some((k) => k.parent === n.id)) continue;
     let x0 = 1e9;
     let y0 = 1e9;
     let x1 = -1e9;
@@ -719,7 +792,7 @@ export function getPieceWorldMatrix(
     out.set(w);
     return out;
   }
-  const wingScale = superWings ? 7 : 1;
+  const wingScale = superWings ? 5 : 1;
   const side = n.id === 'braceL' ? 1 : -1;
   const flareRad = side * -32 * wingPop * DEG;
   const c = Math.cos(flareRad) * wingScale;
