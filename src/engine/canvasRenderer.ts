@@ -1,4 +1,14 @@
-import { getPieceWorldMatrix, getTensionRatio, mkCanvas, parentOf, pos, samplePieceWorldMask, solveRig } from './fkEngine';
+/**
+ * Feature Notes (Plain English):
+ * - Stage Renderer & Digital X-Ray: Draws Bitruvius in crisp purple-and-black Analog mode
+ *   or softened blurred Digital mode with green bone overlays and hidden-layer X-ray cutouts.
+ * - Canvas Backdrop Text & Complementary Green Filter: Places "Welcome Bitruvius." and the
+ *   drag-hands guidance behind the figure between head-top and ankles, constrained to canvas
+ *   width, turning any colliding letters over the model into our complementary studio green.
+ * - Perspective Grid & Elastic Pin Tethers: Renders Horizon, Ground, Vanishing Point, and
+ *   live rubber-band tethers when effectors pull away from full-rig pin anchors.
+ */
+import { computeRigWorldBounds, getPieceWorldMatrix, getTensionRatio, mkCanvas, parentOf, pos, samplePieceWorldMask, solveRig } from './fkEngine';
 import {
   GOTZ_BUILDS,
   GOTZ_DIGITS,
@@ -60,7 +70,6 @@ export interface RenderContextState {
   actUntil: number;
   bgColor: string;
   wingPop?: number;
-  superWings?: boolean;
   abcGhosts?: AbcGhostItem[];
   ikOverlay?: IKOverlayState;
   handRGotz?: GotzHandState;
@@ -70,6 +79,12 @@ export interface RenderContextState {
   persp?: PerspectiveState;
   hoverPersp?: PerspHandle;
   draggingPersp?: PerspHandle;
+  hidePerspLabels?: boolean;
+  backdropWelcome?: string;
+  backdropHint?: string;
+  hideBackdropText?: boolean;
+  safeRightPx?: number;
+  safeBottomPx?: number;
 }
 
 /**
@@ -153,6 +168,9 @@ export class StageRenderer {
   private ghostBuf: OffscreenCanvas | HTMLCanvasElement | null = null;
   private xraySilBuf: OffscreenCanvas | HTMLCanvasElement | null = null;
   private xrayOutBuf: OffscreenCanvas | HTMLCanvasElement | null = null;
+  private backdropTextBuf: OffscreenCanvas | HTMLCanvasElement | null = null;
+  private modelMaskBuf: OffscreenCanvas | HTMLCanvasElement | null = null;
+  private collisionTextBuf: OffscreenCanvas | HTMLCanvasElement | null = null;
   private tmpMat = new Float64Array(6);
   private SKP = [0, 0, 0, 0, 0, 0];
 
@@ -197,12 +215,11 @@ export class StageRenderer {
     const Y0 = state.oy * f;
 
     const wingPop = state.wingPop ?? 0;
-    const superWings = state.superWings ?? false;
 
     for (const p of state.pieces) {
       const bm = p.bm;
       if (!bm || !p.node) continue;
-      const q = getPieceWorldMatrix(p, wingPop, this.tmpMat, superWings);
+      const q = getPieceWorldMatrix(p, wingPop, this.tmpMat);
       const m0 = k * q[0];
       const m1 = k * q[1];
       const m2 = k * q[2];
@@ -230,9 +247,11 @@ export class StageRenderer {
     const hd = state.by.head;
     if (!hd || !hd.pieces.length) return false;
     const w = hd.w;
+    const hp = hd.pieces[0];
+    const headShiftY = (hp.restBox ? hp.restBox.y : hp.y) - 18;
     for (let i = 0; i < 2; i++) {
       const x = SK[i][0];
-      const y = SK[i][1];
+      const y = SK[i][1] + headShiftY;
       this.SKP[i * 2] = (w[0] * x + w[2] * y + w[4]) * state.z + state.ox;
       this.SKP[i * 2 + 1] = (w[1] * x + w[3] * y + w[5]) * state.z + state.oy;
     }
@@ -316,10 +335,10 @@ export class StageRenderer {
     this.glowMagenta = this.glowMagenta || this.mkGlow('255,59,107');
 
     if (analog) {
-      ctx.strokeStyle = 'rgba(34, 197, 94, 0.31)';
-      ctx.lineWidth = 0.8 * dpr;
-      ctx.shadowBlur = 4 * dpr;
-      ctx.shadowColor = 'rgba(34, 197, 94, 0.25)';
+      ctx.strokeStyle = 'rgba(34, 197, 94, 0.14)';
+      ctx.lineWidth = 0.65 * dpr;
+      ctx.shadowBlur = 1.5 * dpr;
+      ctx.shadowColor = 'rgba(34, 197, 94, 0.12)';
       ctx.beginPath();
       this.forEachSegment(state, sk, (a, b, c, e, kind) => {
         if (kind !== 2) {
@@ -362,10 +381,10 @@ export class StageRenderer {
     }
 
     const drawDot = (x: number, y: number, isTension: boolean, ghost: boolean, scale = 1) => {
-      const r = (analog ? 9 : 15) * scale * dpr;
+      const r = (analog ? 5.2 : 15) * scale * dpr;
       const g = isTension ? this.glowMagenta! : this.glowGreen!;
       const m = ghost ? 0.3 : 1;
-      ctx.globalAlpha = (analog ? 0.55 : 0.92) * m;
+      ctx.globalAlpha = (analog ? 0.25 : 0.92) * m;
       ctx.drawImage(g, x - r, y - r, 2 * r, 2 * r);
       if (!analog) {
         const r2 = 4 * scale * dpr;
@@ -428,10 +447,10 @@ export class StageRenderer {
         return [(hw[0] * rx + hw[2] * ry + hw[4]) * z + ox, (hw[1] * rx + hw[3] * ry + hw[5]) * z + oy];
       };
 
-      ctx.strokeStyle = analog ? 'rgba(34, 197, 94, 0.31)' : 'rgba(34, 197, 94, 0.54)';
-      ctx.lineWidth = (analog ? 0.75 : 1.1) * dpr;
-      ctx.shadowBlur = (analog ? 3.5 : 6) * dpr;
-      ctx.shadowColor = 'rgba(34, 197, 94, 0.42)';
+      ctx.strokeStyle = analog ? 'rgba(34, 197, 94, 0.14)' : 'rgba(34, 197, 94, 0.54)';
+      ctx.lineWidth = (analog ? 0.6 : 1.1) * dpr;
+      ctx.shadowBlur = (analog ? 1.5 : 6) * dpr;
+      ctx.shadowColor = analog ? 'rgba(34, 197, 94, 0.14)' : 'rgba(34, 197, 94, 0.42)';
       ctx.beginPath();
       for (const d of active) {
         const pts = solved[d].pts;
@@ -465,18 +484,19 @@ export class StageRenderer {
 
   private drawActiveBars(state: RenderContextState, act: number) {
     const { ctx, dpr } = state;
-    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalCompositeOperation = 'source-over';
     ctx.lineCap = 'round';
     const sk = this.computeSkull(state);
+    const softAct = act * 0.65;
 
     for (const [wd, al] of [
-      [14, 0.12],
-      [8, 0.25],
-      [3.5, 0.6],
+      [4.5, 0.06],
+      [2.2, 0.12],
+      [1.0, 0.24],
     ]) {
       ctx.lineWidth = wd * dpr;
       ctx.strokeStyle = GREEN;
-      ctx.globalAlpha = al * act;
+      ctx.globalAlpha = al * softAct;
       ctx.beginPath();
       this.forEachSegment(state, sk, (a, b, c, e, kind) => {
         if (kind === 0) {
@@ -488,7 +508,7 @@ export class StageRenderer {
 
       // Tension-strained bond bars glow magenta-red when active
       ctx.strokeStyle = MAGENTA;
-      ctx.globalAlpha = Math.min(1, al * 1.25) * act;
+      ctx.globalAlpha = Math.min(1, al * 1.45) * softAct;
       ctx.beginPath();
       this.forEachSegment(state, sk, (a, b, c, e, kind) => {
         if (kind === 1) {
@@ -499,7 +519,6 @@ export class StageRenderer {
       ctx.stroke();
     }
 
-    ctx.globalCompositeOperation = 'source-over';
     ctx.globalAlpha = 1;
     ctx.lineCap = 'butt';
   }
@@ -723,12 +742,14 @@ export class StageRenderer {
     ctx.fill();
     ctx.restore();
 
-    // 8. Micro architectural edge labels
-    ctx.font = `${Math.round(10 * dpr)}px "JetBrains Mono", monospace`;
-    ctx.fillStyle = hHot ? '#34d399' : 'rgba(192, 132, 252, 0.68)';
-    ctx.fillText('HORIZON', 10 * dpr, Math.max(12 * dpr, hyS - 4 * dpr));
-    ctx.fillStyle = gHot ? '#34d399' : 'rgba(192, 132, 252, 0.74)';
-    ctx.fillText('GROUND', 10 * dpr, Math.min(cv.height - 6 * dpr, gyS - 5 * dpr));
+    // 8. Micro architectural edge labels (skipped on live stage when StageHud overlays them cleanly)
+    if (!state.hidePerspLabels) {
+      ctx.font = `${Math.round(10 * dpr)}px "JetBrains Mono", monospace`;
+      ctx.fillStyle = hHot ? '#34d399' : 'rgba(192, 132, 252, 0.68)';
+      ctx.fillText('HORIZON', 10 * dpr, Math.max(12 * dpr, hyS - 4 * dpr));
+      ctx.fillStyle = gHot ? '#34d399' : 'rgba(192, 132, 252, 0.74)';
+      ctx.fillText('GROUND', 10 * dpr, Math.min(cv.height - 6 * dpr, gyS - 5 * dpr));
+    }
 
     ctx.restore();
   }
@@ -1211,14 +1232,26 @@ export class StageRenderer {
     this.drawPerspectiveSystem(state);
     this.drawAbcGhosts(state);
 
+    const hasBackdropText = !state.hideBackdropText && this.prepareBackdropTextMask(state, w, h);
+    if (hasBackdropText && this.backdropTextBuf) {
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.globalAlpha = 0.22;
+      ctx.drawImage(this.backdropTextBuf, 0, 0);
+      ctx.restore();
+    }
+
     if (mode === 'A') {
       if (showBones) this.drawBonesLayer(state, true);
       this.drawArt(ctx, 1, w, h, state);
+      if (hasBackdropText) {
+        this.drawComplementaryCollisionText(ctx, w, h, state, false);
+      }
       if (showBones && live) {
         this.drawActiveBars(state, isActiveMotion ? 1 : Math.max(0, Math.min(1, (actUntil - now) / 700)));
       }
     } else {
-      const f = 0.2;
+      const f = 0.22;
       const lw = Math.max(1, Math.ceil(w * f));
       const lh = Math.max(1, Math.ceil(h * f));
       if (!this.lo || this.lo.width !== lw || this.lo.height !== lh) {
@@ -1229,11 +1262,16 @@ export class StageRenderer {
         this.loc.setTransform(1, 0, 0, 1, 0, 0);
         this.loc.clearRect(0, 0, lw, lh);
         this.drawArt(this.loc, f, lw, lh, state);
+        ctx.save();
         ctx.imageSmoothingEnabled = true;
         ctx.imageSmoothingQuality = 'high';
-        ctx.globalAlpha = 0.6;
+        ctx.filter = `blur(${Math.max(4, Math.round(6 * dpr))}px)`;
+        ctx.globalAlpha = 0.45;
         ctx.drawImage(this.lo, 0, 0, w, h);
-        ctx.globalAlpha = 1;
+        ctx.restore();
+        if (hasBackdropText) {
+          this.drawComplementaryCollisionText(ctx, w, h, state, true);
+        }
       }
       if (showBones) this.drawBonesLayer(state, false);
     }
@@ -1418,6 +1456,189 @@ export class StageRenderer {
       ctx.stroke();
     }
 
+    // 6. Elastic Pin Full Rig rubber-band tethers showing stretch back toward pin anchors
+    if (ik.elasticTethers && ik.elasticTethers.length) {
+      for (const tether of ik.elasticTethers) {
+        const ax = tether.anchor[0] * z + ox;
+        const ay = tether.anchor[1] * z + oy;
+        const cx = tether.current[0] * z + ox;
+        const cy = tether.current[1] * z + oy;
+        ctx.save();
+        ctx.strokeStyle = 'rgba(245, 158, 11, 0.9)';
+        ctx.lineWidth = 2.2 * dpr;
+        ctx.setLineDash([5 * dpr, 4 * dpr]);
+        ctx.beginPath();
+        ctx.moveTo(ax, ay);
+        ctx.lineTo(cx, cy);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.strokeStyle = '#34d399';
+        ctx.lineWidth = 1.8 * dpr;
+        ctx.beginPath();
+        ctx.arc(ax, ay, 8 * dpr, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+
+    ctx.restore();
+  }
+
+  /**
+   * Renders "Welcome Bitruvius." and the drag-hands guidance into a crisp mask constrained
+   * horizontally to the unobstructed canvas width and vertically between top of head and ankles.
+   */
+  private prepareBackdropTextMask(state: RenderContextState, w: number, h: number): boolean {
+    if (w < 60 || h < 60) return false;
+    if (!this.backdropTextBuf) this.backdropTextBuf = mkCanvas(w, h);
+    if (this.backdropTextBuf.width !== w || this.backdropTextBuf.height !== h) {
+      this.backdropTextBuf.width = w;
+      this.backdropTextBuf.height = h;
+    }
+    const g = this.backdropTextBuf.getContext('2d') as
+      | CanvasRenderingContext2D
+      | OffscreenCanvasRenderingContext2D
+      | null;
+    if (!g) return false;
+
+    const { dpr, z, ox, oy, by, pieces, wingPop } = state;
+    const padX = 20 * dpr;
+    const rightBlock = (state.safeRightPx ?? 0) * dpr;
+    const bottomBlock = (state.safeBottomPx ?? 0) * dpr;
+    const availW = Math.max(120 * dpr, w - rightBlock - padX * 2);
+    const centerX = padX + availW * 0.5;
+
+    const bounds = computeRigWorldBounds(by, pieces, wingPop ?? 0);
+    const rawHeadTop = bounds ? bounds.headTopY * z + oy : 28 * dpr;
+    const rawAnkles = bounds ? bounds.anklesY * z + oy : h - bottomBlock - 28 * dpr;
+
+    const bandTop = Math.max(16 * dpr, Math.min(h - bottomBlock - 76 * dpr, rawHeadTop));
+    const bandBottom = Math.max(bandTop + 60 * dpr, Math.min(h - bottomBlock - 14 * dpr, rawAnkles));
+    const bandH = bandBottom - bandTop;
+
+    const welcome = state.backdropWelcome ?? 'Welcome Bitruvius.';
+    const hint =
+      state.backdropHint ??
+      'Drag hands, feet, knees, or spine for FABRIK IK (Alt = pure FK) · double-click head, hand, foot or wing circle · double right-click copies JSON';
+
+    g.setTransform(1, 0, 0, 1, 0, 0);
+    g.clearRect(0, 0, w, h);
+    g.fillStyle = '#ffffff';
+    g.textAlign = 'center';
+    g.textBaseline = 'middle';
+
+    // 1. Welcome headline in crisp digital monospace scaled cleanly to fit availW & upper chest band
+    let titleSize = Math.max(15 * dpr, Math.min(48 * dpr, bandH * 0.135));
+    const applyTitleFont = (px: number) => {
+      g.font = `700 ${px}px "JetBrains Mono", ui-monospace, monospace`;
+    };
+    applyTitleFont(titleSize);
+    const measuredTitleW = g.measureText(welcome).width;
+    if (measuredTitleW > availW * 0.9 && measuredTitleW > 1) {
+      titleSize = Math.max(12 * dpr, titleSize * ((availW * 0.9) / measuredTitleW));
+      applyTitleFont(titleSize);
+    }
+    const welcomeY = bandTop + Math.max(titleSize * 0.65, bandH * 0.28);
+    g.fillText(welcome, centerX, welcomeY);
+
+    // 2. Drag-hands guidance in digital monospace word-wrapped cleanly inside availW * 0.88 above ankles
+    let hintSize = Math.max(10 * dpr, Math.min(16 * dpr, bandH * 0.038));
+    const maxHintW = availW * 0.88;
+    const words = hint.split(' ');
+    const wrapLines = (fontPx: number): string[] => {
+      g.font = `500 ${fontPx}px "JetBrains Mono", ui-monospace, monospace`;
+      const lines: string[] = [];
+      let cur = '';
+      for (const word of words) {
+        const cand = cur ? `${cur} ${word}` : word;
+        if (g.measureText(cand).width <= maxHintW || !cur) {
+          cur = cand;
+        } else {
+          lines.push(cur);
+          cur = word;
+        }
+      }
+      if (cur) lines.push(cur);
+      return lines;
+    };
+
+    let lines = wrapLines(hintSize);
+    while (lines.length > 3 && hintSize > 9.5 * dpr) {
+      hintSize *= 0.9;
+      lines = wrapLines(hintSize);
+    }
+    const lineH = hintSize * 1.38;
+    const totalHintH = lines.length * lineH;
+    const desiredCenterY = Math.max(welcomeY + titleSize * 0.95 + totalHintH * 0.5, bandTop + bandH * 0.72);
+    const clampedCenterY = Math.min(bandBottom - totalHintH * 0.5 - 4 * dpr, desiredCenterY);
+    const startY = clampedCenterY - ((lines.length - 1) * lineH) * 0.5;
+    lines.forEach((line, idx) => {
+      g.fillText(line, centerX, startY + idx * lineH);
+    });
+
+    return true;
+  }
+
+  /**
+   * Complementary Green Collision Filter: intersects the backdrop typography mask with the live
+   * purple-and-black model silhouette so overlapping letters glow cleanly in our studio green (#22c55e).
+   */
+  private drawComplementaryCollisionText(
+    ctx: CanvasRenderingContext2D,
+    w: number,
+    h: number,
+    state: RenderContextState,
+    useBlurredDigital: boolean,
+  ): void {
+    if (!this.backdropTextBuf) return;
+    const scale = 0.5;
+    const cw = Math.max(1, Math.ceil(w * scale));
+    const ch = Math.max(1, Math.ceil(h * scale));
+
+    if (!this.modelMaskBuf) this.modelMaskBuf = mkCanvas(cw, ch);
+    if (this.modelMaskBuf.width !== cw || this.modelMaskBuf.height !== ch) {
+      this.modelMaskBuf.width = cw;
+      this.modelMaskBuf.height = ch;
+    }
+    if (!this.collisionTextBuf) this.collisionTextBuf = mkCanvas(cw, ch);
+    if (this.collisionTextBuf.width !== cw || this.collisionTextBuf.height !== ch) {
+      this.collisionTextBuf.width = cw;
+      this.collisionTextBuf.height = ch;
+    }
+
+    const mctx = this.modelMaskBuf.getContext('2d') as
+      | CanvasRenderingContext2D
+      | OffscreenCanvasRenderingContext2D
+      | null;
+    const cctx = this.collisionTextBuf.getContext('2d') as
+      | CanvasRenderingContext2D
+      | OffscreenCanvasRenderingContext2D
+      | null;
+    if (!mctx || !cctx) return;
+
+    mctx.setTransform(1, 0, 0, 1, 0, 0);
+    mctx.clearRect(0, 0, cw, ch);
+    if (useBlurredDigital && this.lo) {
+      mctx.drawImage(this.lo, 0, 0, cw, ch);
+    } else {
+      this.drawArt(mctx, scale, cw, ch, state);
+    }
+
+    cctx.setTransform(1, 0, 0, 1, 0, 0);
+    cctx.globalCompositeOperation = 'source-over';
+    cctx.clearRect(0, 0, cw, ch);
+    cctx.drawImage(this.backdropTextBuf, 0, 0, cw, ch);
+    cctx.globalCompositeOperation = 'source-in';
+    cctx.drawImage(this.modelMaskBuf, 0, 0, cw, ch);
+    cctx.globalCompositeOperation = 'source-in';
+    cctx.fillStyle = GREEN;
+    cctx.fillRect(0, 0, cw, ch);
+    cctx.globalCompositeOperation = 'source-over';
+
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalAlpha = useBlurredDigital ? 0.56 : 0.72;
+    ctx.drawImage(this.collisionTextBuf, 0, 0, w, h);
     ctx.restore();
   }
 }

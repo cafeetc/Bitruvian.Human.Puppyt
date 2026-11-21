@@ -1,6 +1,12 @@
+/**
+ * Feature Notes (Plain English):
+ * - Modular Sub-Rig Pop-Up: Hosts either the Gotz Hand Editor (with forearm above wrist)
+ *   or the Piggy Foot bone stack inside an on-canvas split panel with an X button to exit.
+ * - Live Body Updates: Every bone drag or toggle immediately re-bakes onto Bitruvius next to it.
+ */
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { renderGreenXRayCutout } from '../engine/canvasRenderer';
-import { DEG, mkCanvas } from '../engine/fkEngine';
+import { DEG, decImage, mkCanvas } from '../engine/fkEngine';
 import { FACE, PartRigManager } from '../engine/partRigEngine';
 import type { PartRigInstance } from '../engine/types';
 import { GotzHandEditor } from './GotzHandEditor';
@@ -10,6 +16,8 @@ interface PartRigModalProps {
   onClose: () => void;
   onMutated: (part: PartRigInstance) => void;
   screenAngleDeg?: number;
+  forearmAngleDeg?: number;
+  onForearmAngleChange?: (deg: number) => void;
 }
 
 const GREEN = '#22c55e';
@@ -40,7 +48,15 @@ function getPartWorldAabb(part: PartRigInstance, k: number): [number, number, nu
   return [minX, minY, maxX, maxY];
 }
 
-export const PartRigModal: React.FC<PartRigModalProps> = ({ part, onClose, onMutated, screenAngleDeg }) => {
+export const PartRigModal: React.FC<PartRigModalProps> = ({
+  part,
+  onClose,
+  onMutated,
+  screenAngleDeg,
+  forearmAngleDeg,
+  onForearmAngleChange,
+}) => {
+  const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const xraySilRef = useRef<OffscreenCanvas | HTMLCanvasElement | null>(null);
   const xrayOutRef = useRef<OffscreenCanvas | HTMLCanvasElement | null>(null);
@@ -50,6 +66,8 @@ export const PartRigModal: React.FC<PartRigModalProps> = ({ part, onClose, onMut
   const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
   const [angleVal, setAngleVal] = useState(0);
   const [flipVal, setFlipVal] = useState(0);
+  const [wideLayout, setWideLayout] = useState(true);
+  const [assetsReadyTick, setAssetsReadyTick] = useState(0);
   const [, setTick] = useState(0);
 
   const viewRef = useRef({ z: 1, ox: 0, oy: 0, dpr: Math.min(window.devicePixelRatio || 1, 2) });
@@ -116,7 +134,6 @@ export const PartRigModal: React.FC<PartRigModalProps> = ({ part, onClose, onMut
     );
     g.drawImage(tp.bm!, tp.x, tp.y, tp.w, tp.h);
 
-    // Mask against front layers using destination-in on a scratch? Simpler: check source-in with each front layer
     g.globalCompositeOperation = 'source-in';
     for (const j of frontIndices) {
       const fp = pe.ps[j];
@@ -137,7 +154,6 @@ export const PartRigModal: React.FC<PartRigModalProps> = ({ part, onClose, onMut
           return true;
         }
       }
-      // Restore target alpha mask for next front layer test
       g.globalCompositeOperation = 'source-over';
       g.setTransform(1, 0, 0, 1, 0, 0);
       g.clearRect(0, 0, S, S);
@@ -187,7 +203,6 @@ export const PartRigModal: React.FC<PartRigModalProps> = ({ part, onClose, onMut
         pg.drawImage(p.bm, p.x, p.y, p.w, p.h);
       }
 
-      // X-Ray view when hovering an item in a stack that has layers in front of it
       if (hovIdx !== null && isLayerOccludedInStack(part, hovIdx)) {
         const hp = part.ps[hovIdx];
         if (hp?.bm) {
@@ -287,15 +302,19 @@ export const PartRigModal: React.FC<PartRigModalProps> = ({ part, onClose, onMut
   const fitPartCanvas = useCallback(() => {
     const pc = canvasRef.current;
     if (!pc || !part) return;
+    const cw = pc.clientWidth;
+    const ch = pc.clientHeight;
+    if (cw < 4 || ch < 4) return;
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    pc.width = pc.clientWidth * dpr;
-    pc.height = pc.clientHeight * dpr;
+    pc.width = Math.round(cw * dpr);
+    pc.height = Math.round(ch * dpr);
     const q = part.ps.filter((_p, k) => part.on0[k]);
-    const x0 = Math.min(...q.map((p) => p.x));
-    const y0 = Math.min(...q.map((p) => p.y));
-    const x1 = Math.max(...q.map((p) => p.x + p.w));
-    const y1 = Math.max(...q.map((p) => p.y + p.h));
-    const pz = Math.min(pc.width / (x1 - x0), pc.height / (y1 - y0)) * 0.9;
+    const list = q.length ? q : part.ps;
+    const x0 = Math.min(...list.map((p) => p.x));
+    const y0 = Math.min(...list.map((p) => p.y));
+    const x1 = Math.max(...list.map((p) => p.x + p.w));
+    const y1 = Math.max(...list.map((p) => p.y + p.h));
+    const pz = Math.min(pc.width / Math.max(1, x1 - x0), pc.height / Math.max(1, y1 - y0)) * 0.88;
     viewRef.current = {
       z: pz,
       ox: (pc.width - (x1 - x0) * pz) / 2 - x0 * pz,
@@ -304,6 +323,40 @@ export const PartRigModal: React.FC<PartRigModalProps> = ({ part, onClose, onMut
     };
     drawPart();
   }, [drawPart, part]);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const update = () => setWideLayout(el.clientWidth >= 500);
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [part]);
+
+  useEffect(() => {
+    if (!part || part.key === 'hand') return;
+    let cancelled = false;
+    const missing = part.ps.filter((p) => !p.bm && p.src);
+    if (missing.length) {
+      Promise.all(
+        missing.map((p) =>
+          decImage(p.src).then((bm) => {
+            p.bm = bm;
+          }),
+        ),
+      )
+        .then(() => {
+          if (!cancelled) setAssetsReadyTick((t) => t + 1);
+        })
+        .catch(() => {
+          // ignore decode error
+        });
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [part]);
 
   useEffect(() => {
     if (!part || part.key === 'hand') return;
@@ -323,11 +376,20 @@ export const PartRigModal: React.FC<PartRigModalProps> = ({ part, onClose, onMut
   useEffect(() => {
     if (!part || part.key === 'hand') return;
     drawPart(selectedIdx, hoveredIdx);
-  }, [drawPart, hoveredIdx, part, selectedIdx, angleVal, flipVal]);
+  }, [assetsReadyTick, drawPart, hoveredIdx, part, selectedIdx, angleVal, flipVal]);
 
   if (!part) return null;
   if (part.key === 'hand' && part.gotz) {
-    return <GotzHandEditor part={part} onClose={onClose} onMutated={onMutated} screenAngleDeg={screenAngleDeg} />;
+    return (
+      <GotzHandEditor
+        part={part}
+        onClose={onClose}
+        onMutated={onMutated}
+        screenAngleDeg={screenAngleDeg}
+        forearmAngleDeg={forearmAngleDeg}
+        onForearmAngleChange={onForearmAngleChange}
+      />
+    );
   }
 
   const toCanvasPts = (e: React.PointerEvent<HTMLCanvasElement>): [number, number] => {
@@ -412,7 +474,12 @@ export const PartRigModal: React.FC<PartRigModalProps> = ({ part, onClose, onMut
   };
 
   return (
-    <div className="fixed inset-2 z-40 flex flex-col overflow-hidden rounded-lg border border-[#2b2f36] bg-[#191b1f] shadow-[0_12px_48px_rgba(0,0,0,0.75)] md:inset-[3%] md:flex-row">
+    <div
+      ref={containerRef}
+      className={`flex h-full w-full overflow-hidden rounded-xl border border-[#2b2f36] bg-[#191b1f] shadow-[0_12px_42px_rgba(0,0,0,0.75)] ${
+        wideLayout ? 'flex-row' : 'flex-col'
+      }`}
+    >
       <canvas
         ref={canvasRef}
         onPointerDown={handlePointerDown}
@@ -421,10 +488,18 @@ export const PartRigModal: React.FC<PartRigModalProps> = ({ part, onClose, onMut
           dragRef.current = null;
         }}
         onPointerLeave={() => setHoveredIdx(null)}
-        className="h-[58%] min-h-0 min-w-0 flex-1 cursor-crosshair touch-none bg-[#121315] md:h-full"
+        className={`min-h-0 min-w-0 flex-1 cursor-crosshair touch-none bg-[#121315] ${
+          wideLayout ? 'h-full' : 'h-[56%]'
+        }`}
       />
 
-      <aside className="flex h-[42%] flex-col gap-2.5 overflow-y-auto border-t border-[#2b2f36] bg-[#191b1f] p-3 md:h-full md:w-[270px] md:border-t-0 md:border-l">
+      <aside
+        className={`flex flex-col gap-2.5 overflow-y-auto bg-[#191b1f] p-3 ${
+          wideLayout
+            ? 'h-full w-[256px] shrink-0 border-l border-[#2b2f36]'
+            : 'h-[44%] border-t border-[#2b2f36]'
+        }`}
+      >
         <div className="flex items-center justify-between gap-2 border-b border-[#2b2f36] pb-2">
           <div className="truncate font-semibold text-[#e6e8ec]">
             {part.title} <span className="text-[#8b919c]">· {part.id}</span>
@@ -447,9 +522,11 @@ export const PartRigModal: React.FC<PartRigModalProps> = ({ part, onClose, onMut
             <button
               type="button"
               onClick={onClose}
-              className="rounded border border-[#10b981]/50 bg-[#10b981]/15 px-2 py-0.5 text-[11.5px] font-medium text-[#34d399] hover:bg-[#10b981]/25"
+              aria-label="Close part editor"
+              title="Exit part editor"
+              className="flex h-6 w-6 items-center justify-center rounded border border-[#2b2f36] bg-[#121315] text-[14px] font-semibold leading-none text-[#c7cbd3] transition-colors hover:border-[#ff3b6b] hover:text-[#ff6b8f]"
             >
-              Close
+              ×
             </button>
           </div>
         </div>
@@ -538,3 +615,4 @@ export const PartRigModal: React.FC<PartRigModalProps> = ({ part, onClose, onMut
     </div>
   );
 };
+

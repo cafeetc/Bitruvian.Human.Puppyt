@@ -1,7 +1,37 @@
+/**
+ * Feature Notes (Plain English):
+ * - Skull Model Views & 360° Head Swivel: Lets the puppet head turn cleanly through
+ *   4 cardinal poses (Front, Side Right, Back, Side Left) using the real PNG skull kits
+ *   and horizontal mirroring for the opposite side, matching Bitruvius's body purple and
+ *   pure black ink while keeping white teeth sharp.
+ */
 import { mkCanvas, setPieceBitmap } from './fkEngine';
 import type { RigNode, RigPiece } from './types';
 
 export type SkullViewMode = 'front' | 'side' | 'back';
+export type HeadTurnStep = 0 | 1 | 2 | 3;
+
+export interface HeadTurnSpec {
+  step: HeadTurnStep;
+  view: SkullViewMode;
+  flipX: boolean;
+  label: string;
+}
+
+// 4-step 360° turntable order matching natural right-turn dragging across the front face:
+// Front -> Side Right (skull-side faces viewer right) -> Back -> Side Left (mirrored left) -> Front
+export const HEAD_TURN_SEQUENCE: readonly HeadTurnSpec[] = [
+  { step: 0, view: 'front', flipX: false, label: 'Front' },
+  { step: 1, view: 'side', flipX: false, label: 'Side Right' },
+  { step: 2, view: 'back', flipX: false, label: 'Back' },
+  { step: 3, view: 'side', flipX: true, label: 'Side Left' },
+] as const;
+
+export function getHeadTurnStep(view: SkullViewMode, headFlipX = false): HeadTurnStep {
+  if (view === 'front') return 0;
+  if (view === 'back') return 2;
+  return headFlipX ? 3 : 1;
+}
 
 interface SkullAssetSpec {
   url: string;
@@ -49,6 +79,12 @@ const skullCache: Partial<Record<'side' | 'back', BitmapCanvas>> = {};
 const skullLoadPromises: Partial<Record<'side' | 'back', Promise<BitmapCanvas>>> = {};
 let activeRequestedMode: SkullViewMode = 'front';
 
+export function setFrontSkullCache(
+  bm: (CanvasImageSource & { width: number; height: number }) | null,
+): void {
+  frontBitmapCache = bm;
+}
+
 /**
  * Crops the real PNG skull sprite to its tight silhouette bounds and harmonizes
  * the primary #6e05f1 purple fill to Bitruvius's exact body purple (#5d03b4)
@@ -77,16 +113,63 @@ function loadNormalizedSkullAsset(mode: 'side' | 'back'): Promise<BitmapCanvas> 
 
       const imgData = g.getImageData(0, 0, spec.w, spec.h);
       const d = imgData.data;
+
+      // Measure the actual browser-decoded dominant purple fill (accounts for embedded ICC/P3 profiles)
+      let sumR = 0;
+      let sumG = 0;
+      let sumB = 0;
+      let count = 0;
+      for (let i = 0; i < d.length; i += 4) {
+        if (d[i + 3] < 220) continue;
+        const r = d[i];
+        const gr = d[i + 1];
+        const b = d[i + 2];
+        if (b > 120 && b > gr + 35 && b > r + 25) {
+          sumR += r;
+          sumG += gr;
+          sumB += b;
+          count++;
+        }
+      }
+      const domR = count > 0 ? sumR / count : 110;
+      const domG = count > 0 ? sumG / count : 5;
+      const domB = count > 0 ? sumB / count : 241;
+
+      const TARGET_R = 93;  // #5d
+      const TARGET_G = 3;   // #03
+      const TARGET_B = 180; // #b4
+
       for (let i = 0; i < d.length; i += 4) {
         if (d[i + 3] < 10) continue;
         const r = d[i];
         const gr = d[i + 1];
         const b = d[i + 2];
-        // Shift #6e05f1 purple tones to exact puppet purple #5d03b4 without touching black or white
-        if (b > gr + 20 && b > r + 15) {
-          d[i] = Math.min(255, Math.round((r * 93) / 110));
-          d[i + 1] = Math.min(255, Math.round((gr * 3) / 5));
-          d[i + 2] = Math.min(255, Math.round((b * 180) / 241));
+
+        // Snap solid purple body fill & remap anti-aliased purple fringes to exact #5d03b4
+        if (b > gr + 16 && b > r + 10) {
+          if (Math.abs(r - domR) <= 14 && Math.abs(gr - domG) <= 14 && Math.abs(b - domB) <= 14) {
+            d[i] = TARGET_R;
+            d[i + 1] = TARGET_G;
+            d[i + 2] = TARGET_B;
+          } else if (gr > domG + 14) {
+            // Blend toward white teeth/highlights
+            const wMix = Math.max(0, Math.min(1, (gr - domG) / Math.max(1, 255 - domG)));
+            d[i] = Math.round(TARGET_R + (255 - TARGET_R) * wMix);
+            d[i + 1] = Math.round(TARGET_G + (255 - TARGET_G) * wMix);
+            d[i + 2] = Math.round(TARGET_B + (255 - TARGET_B) * wMix);
+          } else {
+            // Blend toward black ink outlines
+            const kMix = Math.max(0, Math.min(1.15, b / Math.max(1, domB)));
+            d[i] = Math.min(255, Math.round(TARGET_R * kMix));
+            d[i + 1] = Math.min(255, Math.round(TARGET_G * kMix));
+            d[i + 2] = Math.min(255, Math.round(TARGET_B * kMix));
+          }
+        } else if (r < 32 && gr < 36 && b < 32) {
+          // Neutralize faint green/chroma tint on dark outlines to match pure #000000 rig ink
+          const lum = Math.round(0.299 * r + 0.587 * gr + 0.114 * b);
+          d[i] = lum < 14 ? 0 : lum;
+          d[i + 1] = lum < 14 ? 0 : lum;
+          d[i + 2] = lum < 14 ? 0 : lum;
         }
       }
       g.putImageData(imgData, 0, 0);
@@ -115,7 +198,7 @@ function applyBox(hp: RigPiece, box: { x: number; y: number; w: number; h: numbe
 export function applySkullView(
   headNode: RigNode,
   mode: SkullViewMode,
-  onWake: () => void,
+  onWake?: () => void,
 ): void {
   if (!headNode.pieces.length) return;
   const hp = headNode.pieces[0];
@@ -124,7 +207,7 @@ export function applySkullView(
   if (!hp.restBox) {
     hp.restBox = { x: hp.x, y: hp.y, w: hp.w, h: hp.h };
   }
-  if (!frontBitmapCache) {
+  if (!frontBitmapCache && hp.name === 'Front') {
     frontBitmapCache = (hp.full0 || hp.bm0 || hp.bm) as
       | (CanvasImageSource & { width: number; height: number })
       | null;
@@ -137,18 +220,19 @@ export function applySkullView(
     if (frontBitmapCache) {
       setPieceBitmap(hp, frontBitmapCache, onWake);
     } else {
-      onWake();
+      onWake?.();
     }
     return;
   }
 
   const spec = SKULL_SPECS[mode];
+  const headOffsetY = hp.restBox.y - 18;
   hp.name = mode === 'side' ? 'Side' : 'Back';
-  headNode.name = mode === 'side' ? 'Head (Side)' : 'Head (Back)';
+  headNode.name = mode === 'side' ? (headNode.flipX ? 'Head (Side L)' : 'Head (Side R)') : 'Head (Back)';
 
   const cached = skullCache[mode];
   if (cached) {
-    applyBox(hp, { x: spec.dx, y: spec.dy, w: spec.w, h: spec.h });
+    applyBox(hp, { x: spec.dx, y: spec.dy + headOffsetY, w: spec.w, h: spec.h });
     setPieceBitmap(hp, cached, onWake);
     return;
   }
@@ -156,10 +240,25 @@ export function applySkullView(
   loadNormalizedSkullAsset(mode)
     .then((canvas) => {
       if (activeRequestedMode !== mode) return;
-      applyBox(hp, { x: spec.dx, y: spec.dy, w: spec.w, h: spec.h });
+      applyBox(hp, { x: spec.dx, y: spec.dy + headOffsetY, w: spec.w, h: spec.h });
       setPieceBitmap(hp, canvas, onWake);
     })
     .catch(() => {
-      onWake();
+      onWake?.();
     });
+}
+
+/**
+ * Applies one of the 4 cardinal 360° head turntable steps cleanly, toggling horizontal flip
+ * for Side Left while keeping Front and Back unflipped.
+ */
+export function applyHeadTurnStep(
+  headNode: RigNode,
+  step: HeadTurnStep,
+  onWake?: () => void,
+): HeadTurnSpec {
+  const spec = HEAD_TURN_SEQUENCE[((step % 4) + 4) % 4];
+  headNode.flipX = spec.flipX;
+  applySkullView(headNode, spec.view, onWake);
+  return spec;
 }

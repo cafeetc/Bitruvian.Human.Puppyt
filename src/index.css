@@ -24,7 +24,7 @@ body,
   overflow: hidden;
   background-color: var(--bg);
   color: var(--fg);
-  font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+  font-family: 'Space Grotesk', 'JetBrains Mono', ui-monospace, system-ui, sans-serif;
   font-size: 13px;
   line-height: 1.4;
   -webkit-font-smoothing: antialiased;

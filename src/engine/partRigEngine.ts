@@ -1,3 +1,9 @@
+/**
+ * Feature Notes (Plain English):
+ * - Sub-Rig & Piggy/Gotz Part Manager: Manages detailed nested parts attached to the main body,
+ *   including the procedural Gotz 5-digit hand (with forearm above wrist) and Piggy multi-bone feet.
+ * - Live Baking: Re-renders modified part layers into sprites on Bitruvius in real time.
+ */
 import { DEG, decImage, mkCanvas, setPieceBitmap } from './fkEngine';
 import {
   GOTZ_PROPS_ANAT,
@@ -7,6 +13,7 @@ import {
   cloneGotzState,
   createDefaultGotzHandState,
 } from './gotzHandEngine';
+import { setFrontSkullCache } from './skullKitModels';
 import type { Keyframe, PartRigInstance, PartsManifest, RigNode } from './types';
 
 export const SKL = 'Skullbone/skull/skullplate';
@@ -57,7 +64,7 @@ export const FACE = {
   exc: {} as Record<string, [number, number]>,
 };
 
-export const PART_LINKS = [{ node: 'lip', inst: 'head', name: 'Chin', k: -1 }];
+export const PART_LINKS: Array<{ node: string; inst: string; name: string; k: number }> = [];
 
 const FOOTA = [
   -0.19088577804596826,
@@ -242,6 +249,14 @@ export class PartRigManager {
           mgr.bake(this, onWake);
           return;
         }
+        if (this.key === 'head') {
+          void mgr.loadPartAssets('head').then(() => {
+            if (fp.name === 'Front') {
+              mgr.bake(this, onWake);
+            }
+          });
+          return;
+        }
         const sourceBm = (fp.full0 || fp.bm0) as (CanvasImageSource & { width: number; height: number }) | undefined;
         if (sourceBm) {
           setPieceBitmap(fp, sourceBm, onWake);
@@ -282,6 +297,17 @@ export class PartRigManager {
     this.mkInst('footL', 'foot', 'footL', true, by, onWake);
     if (this.inst.handR) this.bake(this.inst.handR, onWake);
     if (this.inst.handL) this.bake(this.inst.handL, onWake);
+    if (this.inst.footR || this.inst.footL) {
+      void this.loadPartAssets('foot').then(onWake);
+    }
+    if (this.inst.head) {
+      void this.loadPartAssets('head').then(() => {
+        const h = this.inst.head;
+        if (h && h.fp.name === 'Front') {
+          this.bake(h, onWake);
+        }
+      });
+    }
     for (const l of this.links) {
       const I = this.inst[l.inst];
       l.k = I ? I.ps.findIndex((p) => p.name === l.name) : -1;
@@ -370,10 +396,21 @@ export class PartRigManager {
       );
       g.drawImage(p.bm, p.x, p.y, p.w, p.h);
     }
+    const commitBaked = (b: CanvasImageSource & { width: number; height: number }) => {
+      if (I.key === 'head') {
+        if (!I.touched) {
+          fp.full0 = b;
+          fp.bm0 = b;
+          setFrontSkullCache(b);
+        }
+        if (fp.name !== 'Front') return;
+      }
+      setPieceBitmap(fp, b, onWake);
+    };
     if (typeof createImageBitmap === 'function') {
-      createImageBitmap(c).then((b) => setPieceBitmap(fp, b, onWake));
+      createImageBitmap(c).then(commitBaked);
     } else {
-      setPieceBitmap(fp, c as HTMLCanvasElement, onWake);
+      commitBaked(c as CanvasImageSource & { width: number; height: number });
     }
   }
 

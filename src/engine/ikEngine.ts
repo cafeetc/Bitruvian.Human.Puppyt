@@ -1,3 +1,11 @@
+/**
+ * Feature Notes (Plain English):
+ * - Inverse Kinematics (IK) & FABRIK: Pulls limbs, knees, spine, and head smoothly toward
+ *   your pointer while keeping grounded/pinned feet planted and joints within anatomical limits.
+ * - Balance & Pin Modes: Shifts body counterweight or locks feet/hands/head in place.
+ * - Dual-Spine Perspective Bend: Subtly counter-curves lower (lumbar) and upper (thorax)
+ *   spine relative to the vanishing point and horizon without fighting manual posing.
+ */
 import {
   DEG,
   clampAnatomicalAngle,
@@ -7,6 +15,13 @@ import {
   pos,
   solveRig,
 } from './fkEngine';
+import {
+  DEFAULT_GROUND_Y,
+  DEFAULT_SPATIAL_ENV,
+  GROUND_TOL,
+  applyGroundAndBalance,
+} from './groundSystem';
+import { dampAngleWithStiffness } from './jointLimits';
 import { LIMB_CHAINS } from './rigMetadata';
 import type {
   IKConfig,
@@ -18,17 +33,10 @@ import type {
   RigNode,
 } from './types';
 
-export const DEFAULT_GROUND_Y = 7013.5;
-export const GROUND_TOL = 32;
+export { DEFAULT_GROUND_Y, GROUND_TOL };
 export const LONG_IK_MS = 260;
 
-export const PERSP_DEFAULT: PerspectiveState = {
-  enabled: true,
-  groundY: DEFAULT_GROUND_Y,
-  horizonY: 3170,
-  vpX: 1257,
-  floorScale: 420,
-};
+export const PERSP_DEFAULT: PerspectiveState = { ...DEFAULT_SPATIAL_ENV };
 
 export const DEFAULT_IK_CONFIG: IKConfig = {
   mode: 'fluid',
@@ -42,6 +50,7 @@ export const DEFAULT_IK_CONFIG: IKConfig = {
   footGravity: true,
   groundY: DEFAULT_GROUND_Y,
   allowStretch: false,
+  elasticPinFull: true,
   bendOverrides: {},
 };
 
@@ -185,8 +194,9 @@ export function solveAnalyticalLimbIK(
 
   const rx = tx - P1[0];
   const ry = ty - P1[1];
-  const dist = Math.hypot(rx, ry) || 1;
-  const aim = Math.atan2(ry, rx);
+  const rawDist = Math.hypot(rx, ry);
+  const dist = rawDist > 1e-3 ? rawDist : 1;
+  const aim = rawDist > 1e-3 ? Math.atan2(ry, rx) : base1;
 
   const hardMax = L1 + L2 - 4;
   const softness = (L1 + L2) * Math.max(0, Math.min(0.3, config.softness));
@@ -203,9 +213,10 @@ export function solveAnalyticalLimbIK(
       const u = Math.min(1, (dist - softStart) / (1.4 * softness));
       d = softStart + softness * (-0.6 * u * u + 0.2 * u + 1.4) * u;
     }
-
-    const cosA = Math.max(-1, Math.min(1, (L1 * L1 + d * d - L2 * L2) / (2 * L1 * d)));
-    const cosB = Math.max(-1, Math.min(1, (L1 * L1 + L2 * L2 - d * d) / (2 * L1 * L2)));
+    // Procedural singularity epsilon: keep Law-of-Cosines away from ±1 derivative spikes
+    const safeCosMax = 0.99985;
+    const cosA = Math.max(-safeCosMax, Math.min(safeCosMax, (L1 * L1 + d * d - L2 * L2) / (2 * L1 * d)));
+    const cosB = Math.max(-safeCosMax, Math.min(safeCosMax, (L1 * L1 + L2 * L2 - d * d) / (2 * L1 * L2)));
     const alpha = Math.acos(cosA);
     const beta = Math.acos(cosB);
     const bs = resolveBendSign(c, U, L, tx, P1, config, bendHint);
@@ -357,13 +368,20 @@ export function solveFABRIKChain(
     const next = chain[i + 1];
     if (curr.lock) continue;
 
+    const prevAng = curr.ang;
     solveRig(nodes, by, bondOn, wingPop);
     const currWorld = pos(curr, by);
     const targetDir = Math.atan2(pts[i + 1][1] - currWorld[1], pts[i + 1][0] - currWorld[0]);
     setWorldDirExact(curr, next.piv, targetDir, by);
 
     if (constrainLimits) {
-      curr.ang = clampAnatomicalAngle(curr, curr.ang, true);
+      curr.ang = dampAngleWithStiffness(
+        curr.id,
+        prevAng,
+        clampAnatomicalAngle(curr, curr.ang, true),
+        true,
+        opts?.allowRootShift ? config.spineStiffness : 0.35,
+      );
     }
     curr.ang = clampRealisticShoulder(curr, curr.ang, by, wingPop > 0.05);
   }
@@ -466,16 +484,18 @@ export function enforceGroundContact(
   groundY: number,
   pullDownToo = false,
 ): boolean {
-  solveRig(nodes, by, bondOn, wingPop);
-  const maxY = figureLowestFootY(by);
-  if (maxY < -1e8) return false;
-  const diff = groundY - maxY;
-  if (diff < -0.5 || (pullDownToo && diff > 0.5)) {
-    root.ty += diff;
-    solveRig(nodes, by, bondOn, wingPop);
-    return true;
-  }
-  return false;
+  return applyGroundAndBalance(
+    nodes,
+    by,
+    root,
+    { groundY },
+    'pinFeet',
+    solveRig,
+    pos,
+    bondOn,
+    wingPop,
+    { pullDownToo },
+  );
 }
 
 /**
@@ -504,6 +524,56 @@ export function hitPerspHandle(
   if (Math.abs(q[1] - persp.horizonY) <= tol) return 'horizon';
   if (Math.abs(q[1] - persp.groundY) <= tol * 1.15) return 'ground';
   return null;
+}
+
+export interface PerspectiveSpineBias {
+  lumbar: number;
+  thorax: number;
+}
+
+/**
+ * Computes a light, always-on 1-point perspective S-curve bias across lower (lumbar)
+ * and upper (thorax) spine segments relative to the vanishing point & horizon.
+ */
+export function computePerspectiveSpineBend(
+  by: Record<string, RigNode>,
+  root: RigNode | undefined,
+  persp: PerspectiveState,
+): PerspectiveSpineBias {
+  if (!persp.enabled) return { lumbar: 0, thorax: 0 };
+  const fx = skelFocalX(by, root);
+  const dx = fx - persp.vpX;
+  const thY = by.thorax ? pos(by.thorax, by)[1] : 2099.5;
+  const hFactor = Math.tanh(dx / 1400);
+  const vFactor = Math.tanh((persp.horizonY - thY) / 2200);
+  const lumbar = Math.round((hFactor * 5.2 + hFactor * vFactor * 2.2) * 100) / 100;
+  const thorax = Math.round((-lumbar * 0.72 + vFactor * hFactor * 1.4) * 100) / 100;
+  return { lumbar, thorax };
+}
+
+/**
+ * Applies only the incremental delta of the dual-spine perspective bend so manual
+ * spine posing, FABRIK drags, and sliders never experience friction or snap-back.
+ */
+export function applyPerspectiveSpineDelta(
+  by: Record<string, RigNode>,
+  root: RigNode | undefined,
+  persp: PerspectiveState,
+  prevBias: PerspectiveSpineBias,
+  constrainLimits: boolean,
+): PerspectiveSpineBias {
+  const next = computePerspectiveSpineBend(by, root, persp);
+  const dLumbar = next.lumbar - prevBias.lumbar;
+  const dThorax = next.thorax - prevBias.thorax;
+  const lu = by.lumbar;
+  const th = by.thorax;
+  if (lu && !lu.lock && Math.abs(dLumbar) > 1e-4) {
+    lu.ang = clampAnatomicalAngle(lu, lu.ang + dLumbar, constrainLimits);
+  }
+  if (th && !th.lock && Math.abs(dThorax) > 1e-4) {
+    th.ang = clampAnatomicalAngle(th, th.ang + dThorax, constrainLimits);
+  }
+  return next;
 }
 
 /**

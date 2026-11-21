@@ -1,3 +1,9 @@
+/**
+ * Feature Notes (Plain English):
+ * - Gotz Hand Pop-Up Editor: Opens as an on-canvas split panel next to Bitruvius so
+ *   changes live-update on the main body. Includes the forearm above the wrist, wrist dial,
+ *   14-pass fingertip IK dragging, presets, bone hierarchy tree, and an X button to exit.
+ */
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   GOTZ_BUILDS,
@@ -18,8 +24,10 @@ import {
   getGotzPoseCode,
   gotzBoneSvgPath,
   gotzCurlBounds,
+  gotzForearmSvgPath,
   gotzRotBounds,
   solveGotzDigitIk,
+  solveGotzForearm,
   solveGotzHand,
 } from '../engine/gotzHandEngine';
 import type { PartRigInstance } from '../engine/types';
@@ -29,6 +37,8 @@ interface GotzHandEditorProps {
   onClose: () => void;
   onMutated: (part: PartRigInstance) => void;
   screenAngleDeg?: number;
+  forearmAngleDeg?: number;
+  onForearmAngleChange?: (deg: number) => void;
 }
 
 const PRESET_NAMES = Object.keys(GOTZ_PRESETS);
@@ -58,18 +68,35 @@ const STYLE_OPTIONS: Array<{ id: GotzStyle; label: string }> = [
   { id: 'legacy', label: 'Octagon' },
 ];
 
-export const GotzHandEditor: React.FC<GotzHandEditorProps> = ({ part, onClose, onMutated, screenAngleDeg }) => {
+export const GotzHandEditor: React.FC<GotzHandEditorProps> = ({
+  part,
+  onClose,
+  onMutated,
+  screenAngleDeg,
+  forearmAngleDeg,
+  onForearmAngleChange,
+}) => {
+  const containerRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement>(null);
   const handGroupRef = useRef<SVGGElement>(null);
   const wheelRef = useRef<SVGSVGElement>(null);
   const undoRef = useRef<GotzHandState[]>([]);
   const redoRef = useRef<GotzHandState[]>([]);
   const [alignToScreen, setAlignToScreen] = useState<boolean>(true);
-  const dragRef = useRef<{
-    digit: GotzDigitId;
-    endPtIdx: number;
-    snapshotSaved: boolean;
-  } | null>(null);
+  const [wideLayout, setWideLayout] = useState<boolean>(true);
+  const dragRef = useRef<
+    | {
+        kind: 'digit';
+        digit: GotzDigitId;
+        endPtIdx: number;
+        snapshotSaved: boolean;
+      }
+    | {
+        kind: 'forearm';
+        snapshotSaved: boolean;
+      }
+    | null
+  >(null);
   const wheelDragRef = useRef<{ startAng: number; wrist0: number; snapshotSaved: boolean } | null>(null);
 
   const [selectedBoneId, setSelectedBoneId] = useState<string>('wrist');
@@ -81,6 +108,16 @@ export const GotzHandEditor: React.FC<GotzHandEditorProps> = ({ part, onClose, o
   const st = part.gotz!;
   const propsModel = part.propsModel === 'leg' ? GOTZ_PROPS_LEG : GOTZ_PROPS_ANAT;
   const activeDigits = GOTZ_BUILDS[st.build] || GOTZ_DIGITS;
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const update = () => setWideLayout(el.clientWidth >= 560);
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   const pushUndo = useCallback((snapshot: GotzHandState) => {
     undoRef.current.push(cloneGotzState(snapshot));
@@ -99,9 +136,12 @@ export const GotzHandEditor: React.FC<GotzHandEditorProps> = ({ part, onClose, o
       part.gotz = next;
       part.touched = 1;
       onMutated(part);
+      if (onForearmAngleChange && typeof next.forearm === 'number') {
+        onForearmAngleChange(next.forearm);
+      }
       setTick((t) => t + 1);
     },
-    [onMutated, part, pushUndo],
+    [onForearmAngleChange, onMutated, part, pushUndo],
   );
 
   const handleUndo = useCallback(() => {
@@ -110,8 +150,11 @@ export const GotzHandEditor: React.FC<GotzHandEditorProps> = ({ part, onClose, o
     part.gotz = undoRef.current.pop()!;
     part.touched = 1;
     onMutated(part);
+    if (onForearmAngleChange && typeof part.gotz.forearm === 'number') {
+      onForearmAngleChange(part.gotz.forearm);
+    }
     setTick((t) => t + 1);
-  }, [onMutated, part]);
+  }, [onForearmAngleChange, onMutated, part]);
 
   const handleRedo = useCallback(() => {
     if (!part.gotz || !redoRef.current.length) return;
@@ -119,19 +162,33 @@ export const GotzHandEditor: React.FC<GotzHandEditorProps> = ({ part, onClose, o
     part.gotz = redoRef.current.pop()!;
     part.touched = 1;
     onMutated(part);
+    if (onForearmAngleChange && typeof part.gotz.forearm === 'number') {
+      onForearmAngleChange(part.gotz.forearm);
+    }
     setTick((t) => t + 1);
-  }, [onMutated, part]);
+  }, [onForearmAngleChange, onMutated, part]);
 
   useEffect(() => {
     undoRef.current = [];
     redoRef.current = [];
     setSelectedBoneId('wrist');
+    if (part.gotz && typeof forearmAngleDeg === 'number' && Math.abs((part.gotz.forearm ?? 0) - forearmAngleDeg) > 0.5) {
+      part.gotz.forearm = Math.max(-65, Math.min(65, forearmAngleDeg));
+    }
     setTick((t) => t + 1);
-  }, [part]);
+  }, [forearmAngleDeg, part]);
 
-  const solved = useMemo(() => solveGotzHand(st, propsModel), [st, propsModel]);
-  const tree = useMemo(() => buildGotzHierarchyTree(st), [st]);
-  const poseCode = useMemo(() => getGotzPoseCode(st), [st]);
+  const effectiveSt = useMemo<GotzHandState>(() => {
+    if (typeof forearmAngleDeg === 'number' && !dragRef.current) {
+      return { ...st, forearm: Math.max(-65, Math.min(65, forearmAngleDeg)) };
+    }
+    return st;
+  }, [forearmAngleDeg, st]);
+
+  const solved = useMemo(() => solveGotzHand(effectiveSt, propsModel), [effectiveSt, propsModel]);
+  const forearmSolved = useMemo(() => solveGotzForearm(effectiveSt), [effectiveSt]);
+  const tree = useMemo(() => buildGotzHierarchyTree(effectiveSt), [effectiveSt]);
+  const poseCode = useMemo(() => getGotzPoseCode(effectiveSt), [effectiveSt]);
 
   const toGotzCoords = (e: React.PointerEvent<SVGSVGElement>): [number, number] | null => {
     const group = handGroupRef.current;
@@ -147,8 +204,11 @@ export const GotzHandEditor: React.FC<GotzHandEditorProps> = ({ part, onClose, o
     return [local.x, local.y];
   };
 
-  const findNearestTarget = (gx: number, gy: number): { digit: GotzDigitId; endPtIdx: number } | null => {
-    let best: { digit: GotzDigitId; endPtIdx: number } | null = null;
+  const findNearestTarget = (
+    gx: number,
+    gy: number,
+  ): { kind: 'digit'; digit: GotzDigitId; endPtIdx: number } | { kind: 'forearm' } | null => {
+    let best: { kind: 'digit'; digit: GotzDigitId; endPtIdx: number } | { kind: 'forearm' } | null = null;
     let bestDist = 1.25;
     for (const d of activeDigits) {
       const pts = solved[d].pts;
@@ -156,9 +216,13 @@ export const GotzHandEditor: React.FC<GotzHandEditorProps> = ({ part, onClose, o
         const dist = Math.hypot(pts[idx][0] - gx, pts[idx][1] - gy);
         if (dist < bestDist) {
           bestDist = dist;
-          best = { digit: d, endPtIdx: idx };
+          best = { kind: 'digit', digit: d, endPtIdx: idx };
         }
       }
+    }
+    const forearmDist = Math.hypot(forearmSolved.elbowPt[0] - gx, forearmSolved.elbowPt[1] - gy);
+    if (forearmDist < bestDist && forearmDist < 1.35) {
+      best = { kind: 'forearm' };
     }
     return best;
   };
@@ -171,8 +235,14 @@ export const GotzHandEditor: React.FC<GotzHandEditorProps> = ({ part, onClose, o
     const hit = findNearestTarget(coords[0], coords[1]);
     if (!hit) return;
     svg.setPointerCapture(e.pointerId);
+    if (hit.kind === 'forearm') {
+      setSelectedBoneId('forearm');
+      dragRef.current = { kind: 'forearm', snapshotSaved: false };
+      return;
+    }
     setSelectedBoneId(`${hit.digit}:${hit.endPtIdx - 1}`);
     dragRef.current = {
+      kind: 'digit',
       digit: hit.digit,
       endPtIdx: hit.endPtIdx,
       snapshotSaved: false,
@@ -185,13 +255,30 @@ export const GotzHandEditor: React.FC<GotzHandEditorProps> = ({ part, onClose, o
     const drag = dragRef.current;
     if (!drag) {
       const hoverHit = findNearestTarget(coords[0], coords[1]);
-      const nextHov = hoverHit ? `${hoverHit.digit}:${hoverHit.endPtIdx - 1}` : null;
+      const nextHov = hoverHit
+        ? hoverHit.kind === 'forearm'
+          ? 'forearm'
+          : `${hoverHit.digit}:${hoverHit.endPtIdx - 1}`
+        : null;
       if (nextHov !== hoveredBoneId) setHoveredBoneId(nextHov);
       return;
     }
     if (!drag.snapshotSaved && part.gotz) {
       pushUndo(part.gotz);
       drag.snapshotSaved = true;
+    }
+    if (drag.kind === 'forearm') {
+      const rawRad = Math.atan2(-coords[0], coords[1]);
+      const rawDeg = (rawRad * 180) / Math.PI;
+      const deg = Math.max(-65, Math.min(65, Math.round((st.mirror ? -rawDeg : rawDeg) * 10) / 10));
+      const next = cloneGotzState(part.gotz!);
+      next.forearm = deg;
+      part.gotz = next;
+      part.touched = 1;
+      onForearmAngleChange?.(deg);
+      onMutated(part);
+      setTick((t) => t + 1);
+      return;
     }
     const next = cloneGotzState(part.gotz!);
     solveGotzDigitIk(drag.digit, drag.endPtIdx, coords[0], coords[1], next, propsModel);
@@ -286,6 +373,18 @@ export const GotzHandEditor: React.FC<GotzHandEditorProps> = ({ part, onClose, o
 
   // Determine selected bone inspector control
   const selectedBoneInfo = useMemo(() => {
+    if (selectedBoneId === 'forearm') {
+      return {
+        label: 'Forearm (Above Wrist)',
+        value: effectiveSt.forearm ?? 0,
+        min: -65,
+        max: 65,
+        onChange: (val: number) =>
+          commitChange((next) => {
+            next.forearm = val;
+          }, false),
+      };
+    }
     if (selectedBoneId === 'wrist') {
       return {
         label: 'Wrist / Carpal Hub',
@@ -376,12 +475,22 @@ export const GotzHandEditor: React.FC<GotzHandEditorProps> = ({ part, onClose, o
         if (ry > maxY) maxY = ry;
       }
     }
-    const padSide = 1.65;
-    const padTop = 1.7;
-    const padBottom = 2.25; // extra bottom breathing room above Wrist Dial & hint bar
+    {
+      const [fx, fy] = forearmSolved.elbowPt;
+      const mx = st.mirror ? -fx : fx;
+      const rx = mx * cosA - fy * sinA;
+      const ry = mx * sinA + fy * cosA;
+      if (rx < minX) minX = rx;
+      if (rx > maxX) maxX = rx;
+      if (ry < minY) minY = ry;
+      if (ry > maxY) maxY = ry;
+    }
+    const padSide = 1.55;
+    const padTop = 1.6;
+    const padBottom = 2.05; // extra bottom breathing room above Wrist Dial & hint bar
     const rawW = maxX - minX + padSide * 2;
     const rawH = maxY - minY + padTop + padBottom;
-    const minSpan = 8.4;
+    const minSpan = 9.2;
     const w = Math.max(minSpan, rawW);
     const h = Math.max(minSpan, rawH);
     const cx = (minX + maxX) * 0.5;
@@ -389,17 +498,26 @@ export const GotzHandEditor: React.FC<GotzHandEditorProps> = ({ part, onClose, o
     const vb = `${(cx - w * 0.5).toFixed(2)} ${(cy - h * 0.5).toFixed(2)} ${w.toFixed(2)} ${h.toFixed(2)}`;
     stageViewBoxRef.current = vb;
     return vb;
-  }, [activeDigits, solved, st.mirror, stageAngleDeg]);
+  }, [activeDigits, forearmSolved.elbowPt, solved, st.mirror, stageAngleDeg]);
 
   return (
-    <div className="fixed inset-2 z-40 flex flex-col overflow-hidden rounded-lg border border-[#2b2f36] bg-[#191b1f] shadow-[0_12px_48px_rgba(0,0,0,0.78)] md:inset-[3%] md:flex-row">
+    <div
+      ref={containerRef}
+      className={`flex h-full w-full min-h-0 min-w-0 overflow-hidden rounded-xl border border-[#2b2f36] bg-[#191b1f] shadow-[0_12px_42px_rgba(0,0,0,0.75)] ${
+        wideLayout ? 'flex-row' : 'flex-col'
+      }`}
+    >
       {/* Interactive Gotz SVG Stage */}
-      <div className="relative flex h-[54%] min-h-0 min-w-0 flex-1 flex-col bg-[#121315] md:h-full">
+      <div
+        className={`relative flex min-h-0 min-w-0 flex-1 flex-col bg-[#121315] ${
+          wideLayout ? 'h-full' : 'h-[52%]'
+        }`}
+      >
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#2b2f36]/80 bg-[#15171b] px-3 py-1.5 text-[11px]">
           <div className="flex flex-wrap items-center gap-2">
-            <span className="font-semibold text-[#e6e8ec]">Gotz.Puppyt Hand Rig v2</span>
+            <span className="font-semibold text-[#e6e8ec]">Gotz Hand</span>
             <span className="rounded bg-[#2b2f36]/80 px-1.5 py-0.5 font-mono text-[10px] text-[#c084fc]">
-              {part.id === 'handR' ? 'Right Hand (viewer left)' : 'Left Hand (viewer right)'}
+              {part.id === 'handR' ? 'Right' : 'Left'}
             </span>
             {screenAngleDeg != null && (
               <button
@@ -412,11 +530,24 @@ export const GotzHandEditor: React.FC<GotzHandEditorProps> = ({ part, onClose, o
                 }`}
                 title="Toggle aligning hand orientation to match its position on screen at that moment"
               >
-                {alignToScreen ? `Aligned to Screen (${Math.round(screenAngleDeg)}°)` : 'Studio Upright (0°)'}
+                {alignToScreen ? `Screen (${Math.round(screenAngleDeg)}°)` : 'Upright (0°)'}
               </button>
             )}
           </div>
-          <div className="font-mono text-[10.5px] text-[#34d399]">{poseCode}</div>
+          <div className="flex items-center gap-2">
+            <span className="hidden font-mono text-[10.5px] text-[#34d399] sm:inline">{poseCode}</span>
+            {!wideLayout && (
+              <button
+                type="button"
+                onClick={onClose}
+                aria-label="Close part editor"
+                title="Close hand editor (Esc)"
+                className="flex h-6 w-6 items-center justify-center rounded border border-[#ff3b6b]/50 bg-[#ff3b6b]/15 text-[13px] font-bold text-[#ff6b8f] hover:bg-[#ff3b6b]/30"
+              >
+                ×
+              </button>
+            )}
+          </div>
         </div>
 
         <svg
@@ -526,6 +657,49 @@ export const GotzHandEditor: React.FC<GotzHandEditorProps> = ({ part, onClose, o
                 );
               })}
 
+            {/* Arm Above the Wrist (Connected Forearm Segment + Live Elbow Handle) */}
+            <g
+              transform={`rotate(${(forearmSolved.angRad * 180) / Math.PI})`}
+              onClick={(ev) => {
+                ev.stopPropagation();
+                setSelectedBoneId('forearm');
+              }}
+              className="cursor-pointer"
+            >
+              <path
+                d={gotzForearmSvgPath(forearmSolved.len, propsModel.width, st.style)}
+                fill="#5d03b4"
+                fillOpacity={0.86}
+                stroke={
+                  selectedBoneId === 'forearm'
+                    ? '#ff3b6b'
+                    : hoveredBoneId === 'forearm'
+                    ? '#34d399'
+                    : '#000000'
+                }
+                strokeWidth={selectedBoneId === 'forearm' || hoveredBoneId === 'forearm' ? 0.12 : 0.085}
+                strokeLinejoin="round"
+              />
+              <line
+                x1={0}
+                y1={forearmSolved.len * 0.14}
+                x2={0}
+                y2={forearmSolved.len * 0.88}
+                stroke={selectedBoneId === 'forearm' ? '#ff6b8f' : 'rgba(255, 255, 255, 0.3)'}
+                strokeWidth={0.05}
+                strokeLinecap="round"
+                pointerEvents="none"
+              />
+            </g>
+            <circle
+              cx={forearmSolved.elbowPt[0]}
+              cy={forearmSolved.elbowPt[1]}
+              r={0.19}
+              fill={selectedBoneId === 'forearm' ? '#ff3b6b' : '#4c1d95'}
+              stroke={hoveredBoneId === 'forearm' ? '#34d399' : '#ffffff'}
+              strokeWidth={0.05}
+            />
+
             {/* Carpal / Wrist Hub */}
             <circle
               cx={0}
@@ -577,13 +751,17 @@ export const GotzHandEditor: React.FC<GotzHandEditorProps> = ({ part, onClose, o
           </div>
         </div>
 
-        <div className="pointer-events-none absolute right-3 bottom-3 rounded bg-[#191b1f]/80 px-2 py-1 text-[10.5px] text-[#8b919c]">
-          Right-click copies hand pose · drag any fingertip/knuckle for 14-pass CCD IK
+        <div className="pointer-events-none absolute right-3 bottom-3 rounded bg-[#191b1f]/80 px-2 py-1 text-[10px] text-[#8b919c]">
+          Drag fingers or forearm elbow handle · live updates body
         </div>
       </div>
 
-      {/* Right Gotz Inspector & Hierarchical Bone Tree */}
-      <aside className="flex h-[46%] flex-col gap-2.5 overflow-y-auto border-t border-[#2b2f36] bg-[#191b1f] p-3 md:h-full md:w-[320px] md:border-t-0 md:border-l">
+      {/* Right / Bottom Gotz Inspector & Hierarchical Bone Tree */}
+      <aside
+        className={`flex flex-col gap-2.5 overflow-y-auto border-[#2b2f36] bg-[#191b1f] p-3 ${
+          wideLayout ? 'h-full w-[285px] shrink-0 border-l' : 'h-[48%] w-full border-t'
+        }`}
+      >
         {/* Header Bar */}
         <div className="flex items-center justify-between gap-1.5 border-b border-[#2b2f36] pb-2">
           <div className="truncate text-[13px] font-semibold text-[#e6e8ec]">
@@ -613,6 +791,7 @@ export const GotzHandEditor: React.FC<GotzHandEditorProps> = ({ part, onClose, o
               onClick={() => {
                 if (part.gotz) pushUndo(part.gotz);
                 part.reset();
+                onForearmAngleChange?.(0);
                 onMutated(part);
                 setTick((t) => t + 1);
               }}
@@ -623,9 +802,11 @@ export const GotzHandEditor: React.FC<GotzHandEditorProps> = ({ part, onClose, o
             <button
               type="button"
               onClick={onClose}
-              className="rounded border border-[#10b981]/50 bg-[#10b981]/15 px-2 py-0.5 text-[11px] font-medium text-[#34d399] hover:bg-[#10b981]/25"
+              aria-label="Close part editor"
+              title="Close hand editor (Esc)"
+              className="flex h-6 w-6 items-center justify-center rounded border border-[#ff3b6b]/50 bg-[#ff3b6b]/15 text-[14px] leading-none font-bold text-[#ff6b8f] hover:bg-[#ff3b6b]/30"
             >
-              Close
+              ×
             </button>
           </div>
         </div>
@@ -815,14 +996,15 @@ export const GotzHandEditor: React.FC<GotzHandEditorProps> = ({ part, onClose, o
           </div>
         </div>
 
-        {/* Master Hand Sliders */}
+        {/* Master Hand & Forearm Sliders */}
         <div className="space-y-1.5 border-t border-[#2b2f36] pt-2 text-[11.5px] text-[#c7cbd3]">
           {(
             [
+              ['Forearm', effectiveSt.forearm ?? 0, -65, 65, (v: number) => (next: GotzHandState) => (next.forearm = v)],
+              ['Wrist', st.wrist, -90, 90, (v: number) => (next: GotzHandState) => (next.wrist = v)],
               ['Splay', st.splay, -100, 100, (v: number) => (next: GotzHandState) => (next.splay = v)],
               ['Tilt', st.tilt, -60, 60, (v: number) => (next: GotzHandState) => (next.tilt = v)],
               ['Thumb Spread', st.thumb, -80, 80, (v: number) => (next: GotzHandState) => (next.thumb = v)],
-              ['Wrist', st.wrist, -90, 90, (v: number) => (next: GotzHandState) => (next.wrist = v)],
             ] as const
           ).map(([label, val, lo, hi, setter]) => (
             <div key={label} className="flex items-center gap-2">
@@ -869,7 +1051,7 @@ export const GotzHandEditor: React.FC<GotzHandEditorProps> = ({ part, onClose, o
           </div>
           {visibleTree.map((b) => {
             const active = selectedBoneId === b.id;
-            const isMeta = b.digit !== 'wrist' && b.boneIdx === 0;
+            const isMeta = b.digit !== 'wrist' && b.digit !== 'forearm' && b.boneIdx === 0;
             const isCollapsed = isMeta && collapsedDigits.has(b.digit);
             return (
               <div

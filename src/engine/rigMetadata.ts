@@ -1,44 +1,13 @@
+import { JOINT_LIMITS } from './jointLimits';
 import type { EffectorRole, LimbChainDef } from './types';
 
 /**
- * Anatomical soft-clamp limits (degrees) stored on every node in the base FK rig.
- * Used as optional FK limit guards & visual tension cues today, and ready for
- * Phase 1 constrain-limits + Phase 5 IK solvers without modifying node schemas.
+ * Anatomical soft-clamp limits (degrees) derived cleanly from JOINT_LIMITS in jointLimits.ts.
+ * Keeps base FK schema synchronized with FABRIK/procedural stiffness bounds.
  */
-export const ANATOMICAL_LIMITS: Record<string, [number, number]> = {
-  pelvis: [-180, 180],
-  hipR: [-145, 145],
-  hipL: [-145, 145],
-  lumbar: [-48, 48],
-  thorax: [-42, 42],
-  ribR: [-28, 28],
-  ribL: [-28, 28],
-  neck: [-45, 45],
-  head: [-65, 65],
-  lip: [-35, 18],
-  braceL: [-18, 18],
-  braceR: [-18, 18],
-  swivelL: [-42, 42],
-  swivelR: [-42, 42],
-  acromionL: [-45, 60],
-  acromionR: [-60, 45],
-  humerusL: [-175, 165],
-  humerusR: [-165, 175],
-  forearmL: [-155, 15],
-  forearmR: [-15, 155],
-  handL: [-85, 85],
-  handR: [-85, 85],
-  thumbL: [-75, 75],
-  thumbR: [-75, 75],
-  fingerL: [-95, 45],
-  fingerR: [-45, 95],
-  femurL: [-135, 120],
-  femurR: [-120, 135],
-  shinL: [-15, 150],
-  shinR: [-150, 15],
-  footL: [-65, 75],
-  footR: [-75, 65],
-};
+export const ANATOMICAL_LIMITS: Record<string, [number, number]> = Object.fromEntries(
+  Object.entries(JOINT_LIMITS).map(([id, lim]) => [id, [lim!.min, lim!.max]]),
+);
 
 /**
  * Canonical 2-bone and spine kinematic chains prepared for future IK,

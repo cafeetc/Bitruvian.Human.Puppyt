@@ -30,6 +30,7 @@ export interface IKConfig {
   footGravity: boolean;
   groundY: number;
   allowStretch: boolean;
+  elasticPinFull: boolean;
   bendOverrides: Record<string, number>;
 }
 
@@ -44,6 +45,7 @@ export interface IKOverlayState {
   targetPos: [number, number] | null;
   holdProgress: number | null;
   holdPos: [number, number] | null;
+  elasticTethers?: Array<{ anchor: [number, number]; current: [number, number] }>;
 }
 
 export interface PerspectiveState {
@@ -95,6 +97,7 @@ export interface RawRigDef {
   nodes: RawNodeDef[];
   dg?: number;
   jn?: number;
+  antiPhallic?: number;
 }
 
 export interface RawPartPiece {

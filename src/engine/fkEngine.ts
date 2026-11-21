@@ -1,3 +1,16 @@
+/**
+ * Feature Notes (Plain English):
+ * - Forward Kinematics (FK) & 43-Joint Rig Graph: Walks parent-to-child from pelvis up
+ *   the dual spine and out each limb, turning local angles into exact world positions.
+ * - Closed-Chain Shoulder Bond & Chungus Rib Anchor: Keeps collarbones, shoulder blades,
+ *   and inner ribs linked reliably with self-corrective stops so nothing snaps inside-out.
+ * - Elastic Prometheus Wings: Lets the back wings pop out smoothly and flex arms alongside them.
+ * - Anti-Phallic Lower Spine Engine: Shifts the lower spine (lumbar) and everything above
+ *   it upward so the lower spine's bottom pixel sits cleanly on the hip swivel point
+ *   instead of hanging down below the hips.
+ * - Body-In-Canvas Guard: Measures the live head-to-toe puppet bounds and clamps panning,
+ *   zooming, and popup room splits so Bitruvius can never leave the visible canvas.
+ */
 import { cloneGotzState } from './gotzHandEngine';
 import { ANATOMICAL_LIMITS, EFFECTOR_ROLES, LIMB_CHAINS } from './rigMetadata';
 import type {
@@ -163,8 +176,8 @@ export function addJoints(def: RawRigDef): void {
 
   if (map.head) {
     def.nodes.push(
-      { id: 'lip', name: 'Upper lip (chin pivot)', parent: 'head', pivot: [1259, 685], pieces: [] },
-      { id: 'chinTip', name: 'Chin point', parent: 'lip', pivot: [1259, 890], pieces: [], lock: 1 },
+      { id: 'lip', name: 'Head pose swivel', parent: 'head', pivot: [1259, 685], pieces: [] },
+      { id: 'chinTip', name: 'Skull tip', parent: 'lip', pivot: [1259, 890], pieces: [], lock: 1 },
     );
   }
 
@@ -228,81 +241,250 @@ export function addJoints(def: RawRigDef): void {
   }
 }
 
+/**
+ * Anti-Phallic Engine: raises the lower spine (`lumbar`) and every descendant above it
+ * (`thorax`, `neck`, `head`, `rib`, `swivel`, `brace`, `wing`, arms, hands) so the
+ * lowest pixel of `lumbar` rests flush on the hip swivel point (`hipR` / `hipL` Y = 3382)
+ * instead of protruding downward between the hips.
+ */
+export function applyAntiPhallicLowerSpine(def: RawRigDef): number {
+  if (def.antiPhallic) return 0;
+  def.antiPhallic = 1;
+  const map: Record<string, (typeof def.nodes)[number]> = {};
+  def.nodes.forEach((n) => {
+    map[n.id] = n;
+  });
+
+  const lum = map.lumbar;
+  if (!lum || !lum.pieces?.length) return 0;
+  const hipRef = map.hipR ?? map.hipL ?? map.pelvis;
+  const hipY = hipRef ? hipRef.pivot[1] : lum.pivot[1];
+
+  let lumbarBottomY = -1e9;
+  for (const p of lum.pieces) {
+    lumbarBottomY = Math.max(lumbarBottomY, p.y + p.h);
+  }
+  const shiftY = hipY - lumbarBottomY;
+  if (!Number.isFinite(shiftY) || Math.abs(shiftY) <= 0.5) return 0;
+
+  // Shift lumbar's own pieces up so its bottom pixel sits at hipY while keeping its swivel on the hips
+  for (const p of lum.pieces) {
+    p.y += shiftY;
+    const rp = p as unknown as { restBox?: { y: number } };
+    if (rp.restBox) rp.restBox.y += shiftY;
+  }
+
+  // Shift every node above lumbar (all strict descendants of lumbar) by the exact same delta
+  const isAboveLumbar = (n: (typeof def.nodes)[number]): boolean => {
+    let cur = n.parent ? map[n.parent] : undefined;
+    let guard = 0;
+    while (cur && guard++ < 64) {
+      if (cur.id === 'lumbar') return true;
+      cur = cur.parent ? map[cur.parent] : undefined;
+    }
+    return false;
+  };
+
+  for (const n of def.nodes) {
+    if (!isAboveLumbar(n)) continue;
+    n.pivot[1] += shiftY;
+    if (n.aim?.from) {
+      n.aim.from[1] += shiftY;
+    }
+    if (n.pieces) {
+      for (const p of n.pieces) {
+        p.y += shiftY;
+        const rp = p as unknown as { restBox?: { y: number } };
+        if (rp.restBox) rp.restBox.y += shiftY;
+      }
+    }
+  }
+  return shiftY;
+}
+
 export type RibAnchorMode = 'upper' | 'lower' | 'ribwings';
 
 /**
- * Safe rotational bounds for ribR/ribL in Chungus Swing ('lower' spine pivot) so
- * the inner rib border stays anchored against the spine (1168..1349) and never stresses or detaches.
+ * Computes live procedural Chungus rib flare bounds from:
+ *  1. Inner rib border clearance vs live Swivel bone (inner rib cannot stretch beyond swivel)
+ *  2. Collarbone (braceL/R) rotation & tendon extension headroom (stops when collarbone locks)
  */
-export function clampChungusRibAngle(id: string, deg: number, mode: RibAnchorMode): number {
-  const norm = normalizeDeg(deg);
+export function computeChungusRibBounds(
+  id: string,
+  by?: Record<string, RigNode>,
+  prometheusWings = false,
+): [number, number] {
+  if (id !== 'ribR' && id !== 'ribL') return [-180, 180];
+  const side: 'R' | 'L' = id === 'ribR' ? 'R' : 'L';
+  const sideSign = side === 'L' ? 1 : -1;
+  const fallbackMax = prometheusWings ? 12.5 : 8.5;
+
+  if (!by || !by.thorax || !by.neck) {
+    return side === 'R' ? [-fallbackMax, 2] : [-2, fallbackMax];
+  }
+
+  const th = by.thorax;
+  const nk = by.neck;
+  const sw = by['swivel' + side];
+  const ac = by['acromion' + side];
+  const br = by['brace' + side];
+
+  // Ensure world transforms on thorax/swivel/acromion/brace reflect current pose before measuring
+  const spinePx = (th.w[0] || th.w[1]) ? pos(th, by) : [th.piv[0], th.piv[1]];
+  const neckPx = (nk.w[0] || nk.w[1]) ? pos(nk, by) : [nk.piv[0], nk.piv[1]];
+  const spDx = neckPx[0] - spinePx[0];
+  const spDy = neckPx[1] - spinePx[1];
+  const spLen = Math.hypot(spDx, spDy) || 1;
+  // Lateral outward unit vector perpendicular to spine (+1 on Left, -1 on Right)
+  const upX = spDx / spLen;
+  const upY = spDy / spLen;
+  const outX = -upY * sideSign;
+  const outY = upX * sideSign;
+
+  // 1. Swivel corridor limit: inner rib medial rim (~1010px above spine junction, starting 74px across midline)
+  let swivelMaxFlare = fallbackMax;
+  if (sw && ac && (ac.w[0] || ac.w[1])) {
+    const swPos = pos(sw, by);
+    const acPos = pos(ac, by);
+    const acLat = (acPos[0] - spinePx[0]) * outX + (acPos[1] - spinePx[1]) * outY;
+    const swLat = (swPos[0] - spinePx[0]) * outX + (swPos[1] - spinePx[1]) * outY;
+    // Measure swivel lateral span at sternal rib height (~85% up toward acromion)
+    const swivelCorridor = Math.max(0, swLat + (acLat - swLat) * 0.82);
+    // Allow inner rib crest to expand at most into 34% of live swivel corridor (strictly inside swivel)
+    const maxLatTravel = Math.max(0, swivelCorridor * 0.34);
+    const sternalHeight = 1010;
+    const medialOffset = 74;
+    const sinBound = Math.max(-0.5, Math.min(0.42, (maxLatTravel + medialOffset) / sternalHeight));
+    // If swivel is pinched tightly (<130px from spine), collapse outward flare cleanly to 0
+    swivelMaxFlare = swivelCorridor < 130 ? 0 : Math.max(0, (Math.asin(sinBound) / DEG));
+  }
+
+  // 2. Collarbone (brace) rotation & tendon extension saturation
+  let collarMaxFlare = fallbackMax;
+  if (br && ac && br.aim && (br.w[0] || br.w[1]) && (ac.w[0] || ac.w[1])) {
+    const brPos = pos(br, by);
+    const acPos = pos(ac, by);
+    const L0 = Math.hypot(br.aim.from[0] - br.piv[0], br.aim.from[1] - br.piv[1]) || 1;
+    const curDist = Math.hypot(acPos[0] - brPos[0], acPos[1] - brPos[1]);
+    const stretchMax = L0 * (prometheusWings ? br.aim.max * 1.04 : br.aim.max);
+    const stretchSat = Math.max(0, Math.min(1, (curDist - L0 * 0.98) / Math.max(1, stretchMax - L0 * 0.98)));
+
+    const maxTilt = br.limits ? Math.max(Math.abs(br.limits[0]), Math.abs(br.limits[1])) : 18;
+    const angSat = Math.max(0, Math.min(1, Math.abs(normalizeDeg(br.ang)) / Math.max(1, maxTilt)));
+
+    const brAxis = Math.atan2(br.w[1], br.w[0]);
+    const thAxis = Math.atan2(th.w[1], th.w[0]);
+    const swingDeg = Math.abs(normalizeDeg((brAxis - thAxis) / DEG));
+    const maxSwing = prometheusWings ? 36 : 22;
+    const swingSat = Math.max(0, Math.min(1, swingDeg / maxSwing));
+
+    const collarSat = Math.max(angSat, stretchSat, swingSat);
+    if (collarSat >= 0.985) {
+      collarMaxFlare = 0;
+    } else {
+      collarMaxFlare = fallbackMax * (1 - collarSat * 0.82);
+    }
+  }
+
+  const maxOut = Math.max(0, Math.min(fallbackMax, swivelMaxFlare, collarMaxFlare));
+  const minIn = 2.0;
+  return side === 'R' ? [-maxOut, minIn] : [-minIn, maxOut];
+}
+
+/**
+ * Reactive rotational bounds for ribR/ribL in Chungus Swing ('lower' mode) anchored at the
+ * upper/lower spine junction [1257.5, 2377.5], halting stretch cleanly before inner rib passes
+ * swivel or collarbone locks.
+ */
+export function clampChungusRibAngle(
+  id: string,
+  deg: number,
+  mode: RibAnchorMode,
+  by?: Record<string, RigNode>,
+  prometheusWings = false,
+): number {
+  const safe = Number.isFinite(deg) ? deg : 0;
+  const norm = normalizeDeg(safe);
   if (mode !== 'lower') return norm;
-  if (id === 'ribR') return Math.max(-6.3, Math.min(2, norm));
-  if (id === 'ribL') return Math.max(-2, Math.min(6.3, norm));
-  return norm;
+  const [min, max] = computeChungusRibBounds(id, by, prometheusWings);
+  return Math.max(min, Math.min(max, norm));
 }
 
 /**
  * Sets ribR & ribL rotational origins between:
- *  - 'upper' (default): shares rotational origin with upper spine & shoulder swivel [1257.5, 2377.5]
- *  - 'lower': Chungus Swing — shares rotational origin with lower spine [1257, 3382]
- *  - 'ribwings': neck anchor [1215, 1327] / [1299, 1271]
+ *  - 'upper': upper chest / manubrium sternum [1258, 1408]
+ *  - 'lower': Chungus Swing — originates where upper spine (thorax) and lower spine (lumbar) meet [1257.5, 2377.5]
+ *  - 'ribwings': bilateral neck anchors [1215, 1327] / [1299, 1271]
  */
-export function applyRibAnchorMode(by: Record<string, RigNode>, mode: RibAnchorMode): void {
+export function applyRibAnchorMode(
+  by: Record<string, RigNode>,
+  mode: RibAnchorMode,
+  prometheusWings = false,
+): void {
   const ribR = by.ribR;
   const ribL = by.ribL;
   if (!ribR || !ribL) return;
   if (mode === 'upper') {
     const th = by.thorax;
-    const px = th ? th.rest[0] : 1257.5;
-    const py = th ? th.rest[1] : 2377.5;
+    const nk = by.neck;
+    const px = nk ? nk.rest[0] : 1258;
+    const py = th && nk ? nk.rest[1] + (th.rest[1] - nk.rest[1]) * 0.216 : 1130;
     ribR.piv = [px, py];
     ribR.rest = [px, py];
     ribL.piv = [px, py];
     ribL.rest = [px, py];
   } else if (mode === 'lower') {
-    const lu = by.lumbar ?? by.pelvis;
-    const px = lu ? lu.rest[0] : 1257;
-    const py = lu ? lu.rest[1] : 3382;
+    // Chungus mode originates exactly where upper and lower spine meet (thorax pivot)
+    const junc = by.thorax;
+    const px = junc ? junc.rest[0] : 1257.5;
+    const py = junc ? junc.rest[1] : 2099.5;
     ribR.piv = [px, py];
     ribR.rest = [px, py];
     ribL.piv = [px, py];
     ribL.rest = [px, py];
-    ribR.ang = clampChungusRibAngle('ribR', ribR.ang, 'lower');
-    ribL.ang = clampChungusRibAngle('ribL', ribL.ang, 'lower');
+    ribR.ang = clampChungusRibAngle('ribR', ribR.ang, 'lower', by, prometheusWings);
+    ribL.ang = clampChungusRibAngle('ribL', ribL.ang, 'lower', by, prometheusWings);
   } else {
-    ribR.piv = [1215, 1327];
-    ribR.rest = [1215, 1327];
-    ribL.piv = [1299, 1271];
-    ribL.rest = [1299, 1271];
+    const nk = by.neck;
+    const nx = nk ? nk.rest[0] : 1258;
+    const ny = nk ? nk.rest[1] : 862.5;
+    ribR.piv = [nx - 43, ny + 186.5];
+    ribR.rest = [nx - 43, ny + 186.5];
+    ribL.piv = [nx + 41, ny + 130.5];
+    ribL.rest = [nx + 41, ny + 130.5];
   }
 }
 
 /**
  * Opens or closes the muscular chest cavity between ribR/ribL when Chungus Swing is paired
- * with Prometheus wings, keeping shoulders & ribs safely aligned inside anatomical bounds.
+ * with Prometheus wings, dynamically sized from reactive swivel & collarbone limits.
  */
-export function applyChungusChestCavity(by: Record<string, RigNode>, openCavity: boolean): void {
+export function applyChungusChestCavity(
+  by: Record<string, RigNode>,
+  openCavity: boolean,
+  prometheusWings = true,
+): void {
   const ribR = by.ribR;
   const ribL = by.ribL;
-  if (ribR && ribL) {
-    if (openCavity) {
-      ribR.ang = clampChungusRibAngle('ribR', Math.min(ribR.ang, -5.5), 'lower');
-      ribL.ang = clampChungusRibAngle('ribL', Math.max(ribL.ang, 5.5), 'lower');
-    } else {
-      ribR.ang = 0;
-      ribL.ang = 0;
-    }
-  }
   if (openCavity) {
     if (by.swivelR) by.swivelR.ang = Math.max(-14, Math.min(by.swivelR.ang, -7));
     if (by.swivelL) by.swivelL.ang = Math.min(14, Math.max(by.swivelL.ang, 7));
+    if (ribR && ribL) {
+      const [minR] = computeChungusRibBounds('ribR', by, prometheusWings);
+      const [, maxL] = computeChungusRibBounds('ribL', by, prometheusWings);
+      const targetR = Math.min(ribR.ang, Math.max(minR, minR * 0.72));
+      const targetL = Math.max(ribL.ang, Math.min(maxL, maxL * 0.72));
+      ribR.ang = clampChungusRibAngle('ribR', targetR, 'lower', by, prometheusWings);
+      ribL.ang = clampChungusRibAngle('ribL', targetL, 'lower', by, prometheusWings);
+    }
+  } else if (ribR && ribL) {
+    ribR.ang = 0;
+    ribL.ang = 0;
   }
 }
 
 /**
- * Abstract parent lookup ready for future Reverse-Hierarchy IK (Pin Feet / Pin Full Rig)
- * without refactoring solver callers.
+ * Abstract parent lookup ready for Reverse-Hierarchy IK without refactoring solver callers.
  */
 export function parentOf(n: RigNode, by: Record<string, RigNode>): RigNode | null {
   return n.parent ? by[n.parent] ?? null : null;
@@ -461,15 +643,15 @@ export function bondAng(
     const wx = lw[0] * X + lw[2] * Y + lw[4];
     const wy = lw[1] * X + lw[3] * Y + lw[5];
     const d = Math.hypot(wx - nx, wy - ny);
-    const stretchTol = 1.12;
-    const loSoft = lo * 0.92;
+    const stretchTol = prometheusWings ? 1.28 : 1.12;
+    const loSoft = lo * (prometheusWings ? 0.8 : 0.92);
     const hiSoft = hi * stretchTol;
     const distErr = d < loSoft ? loSoft - d : d > hiSoft ? d - hiSoft : 0;
     const lateralSigned = ((wx - nx) * tw[0] + (wy - ny) * tw[1]) * sideSign;
-    const minLat = prometheusWings ? 60 : 240;
+    const minLat = prometheusWings ? 32 : 240;
     const latErr = lateralSigned < minLat ? (minLat - lateralSigned) * 4 : 0;
     const relAng = Math.abs(normalizeDeg(a - txAng));
-    const maxRel = prometheusWings ? 75 : 32;
+    const maxRel = prometheusWings ? 95 : 32;
     const angErr = relAng > maxRel ? (relAng - maxRel) * 25 : 0;
     return distErr + latErr + angErr;
   };
@@ -522,40 +704,135 @@ export function setAim(n: RigNode, by: Record<string, RigNode>, bondOn: boolean,
   const Y = pw[1] * p[0] + pw[3] * p[1] + pw[5];
   const vx = Qx - X;
   const vy = Qy - Y;
-  const dist = Math.hypot(vx, vy) || 1;
+  const rawDist = Math.hypot(vx, vy);
+  // Procedural singularity guard if target collapses onto pivot
+  const dist = rawDist > 1e-3 ? rawDist : 1;
   const L0 = Math.hypot(F[0] - p[0], F[1] - p[1]) || 1;
-  // Strictly rigid rotation (zero scaling/stretching) with elastic axial slide & thorax-relative tilt
-  const maxTilt = prometheusWings ? 45 : 14;
+  const maxTilt = prometheusWings ? 62 : 14;
   const clampedAng = Math.max(-maxTilt, Math.min(maxTilt, normalizeDeg(n.ang)));
-  let a = Math.atan2(vy, vx) - Math.atan2(F[1] - p[1], F[0] - p[0]) + clampedAng * DEG;
+  const dirX = rawDist > 1e-3 ? vx / dist : Math.cos(Math.atan2(pw[1], pw[0]));
+  const dirY = rawDist > 1e-3 ? vy / dist : Math.sin(Math.atan2(pw[1], pw[0]));
+  let a = Math.atan2(dirY, dirX) - Math.atan2(F[1] - p[1], F[0] - p[0]) + clampedAng * DEG;
   if (!prometheusWings) {
     const thoraxRad = Math.atan2(pw[1], pw[0]);
     const relRad = Math.atan2(Math.sin(a - thoraxRad), Math.cos(a - thoraxRad));
     const maxSwing = 24 * DEG;
     a = thoraxRad + Math.max(-maxSwing, Math.min(maxSwing, relRad));
   }
-  const ux = vx / dist;
-  const uy = vy / dist;
   const delta = dist - L0;
-  const rawSlide = delta * (prometheusWings ? 0.62 : 0.5);
+  const rawSlide = delta * (prometheusWings ? 0.78 : 0.5);
   const [minS, maxS] = bondOn
     ? prometheusWings
-      ? [-0.38 * L0, 0.18 * L0]
+      ? [-0.52 * L0, 0.36 * L0]
       : [-0.24 * L0, 0.14 * L0]
-    : [-0.14 * L0, 0.08 * L0];
+    : prometheusWings
+      ? [-0.26 * L0, 0.22 * L0]
+      : [-0.14 * L0, 0.08 * L0];
   // Smooth elastic knee easing when stretching near shoulder bond limits
   const span = Math.max(1, (maxS - minS) * 0.5);
   const mid = (minS + maxS) * 0.5;
   const slide = mid + span * Math.tanh((rawSlide - mid) / span);
-  const c = Math.cos(a);
-  const s = Math.sin(a);
+  // Subtle procedural micro-scale cushion (more elastic give in Prometheus mode)
+  const stretchRatio = (delta - slide) / L0;
+  const scaleCap = prometheusWings ? 0.028 : 0.014;
+  const microScale = 1 + Math.max(-scaleCap, Math.min(scaleCap, stretchRatio * (prometheusWings ? 0.08 : 0.06)));
+  const c = Math.cos(a) * microScale;
+  const s = Math.sin(a) * microScale;
   const w = n.w;
   w[0] = c;
   w[1] = s;
   w[2] = -s;
   w[3] = c;
-  w[4] = X + ux * slide - (c * p[0] - s * p[1]);
-  w[5] = Y + uy * slide - (s * p[0] + c * p[1]);
+  w[4] = X + dirX * slide - (c * p[0] - s * p[1]);
+  w[5] = Y + dirY * slide - (s * p[0] + c * p[1]);
+}
+
+export interface PrometheusShoulderDragBaseline {
+  swivel0: number;
+  acro0: number;
+  brace0: number;
+  humerus0: number;
+  forearm0: number;
+  hand0: number;
+}
+
+/**
+ * Elastic Prometheus wing coupling: dragging or articulating a popped Prometheus wing
+ * flexes the collarbone & shoulder swivel elastically while driving strong compensatory
+ * follow-through across the upper arm, elbow, and wrist (greater than normal shoulder coupling).
+ */
+export function applyPrometheusArmCompensation(
+  side: 'L' | 'R',
+  by: Record<string, RigNode>,
+  base: PrometheusShoulderDragBaseline,
+  dSwivel: number,
+  dNeck: number,
+  constrainLimits: boolean,
+): void {
+  const swivel = by['swivel' + side];
+  const acromion = by['acromion' + side];
+  const brace = by['brace' + side];
+  const humerus = by['humerus' + side];
+  const forearm = by['forearm' + side];
+  const hand = by['hand' + side];
+  if (!swivel || !acromion || !brace) return;
+
+  const targetBrace = Math.max(-54, Math.min(54, normalizeDeg(base.brace0 + dNeck)));
+  brace.ang = constrainLimits ? clampAnatomicalAngle(brace, targetBrace, true) : targetBrace;
+  const dBrace = normalizeDeg(brace.ang - base.brace0);
+
+  swivel.ang = clampAnatomicalAngle(
+    swivel,
+    base.swivel0 + dSwivel * 1.15 + dBrace * 0.52,
+    constrainLimits,
+  );
+  acromion.ang = clampAnatomicalAngle(
+    acromion,
+    base.acro0 - dSwivel * 0.35 - dBrace * 0.35,
+    constrainLimits,
+  );
+
+  if (humerus) {
+    humerus.ang = clampAnatomicalAngle(
+      humerus,
+      base.humerus0 + dBrace * 0.85 + dSwivel * 0.32,
+      constrainLimits,
+    );
+  }
+  if (forearm) {
+    forearm.ang = clampAnatomicalAngle(
+      forearm,
+      base.forearm0 + dBrace * 0.42,
+      constrainLimits,
+    );
+  }
+  if (hand) {
+    hand.ang = clampAnatomicalAngle(
+      hand,
+      base.hand0 - dBrace * 0.28,
+      constrainLimits,
+    );
+  }
+}
+
+/**
+ * Reciprocal elastic wing/shoulder follow when moving an arm while Prometheus wings are active.
+ */
+export function applyPrometheusWingFollowFromArm(
+  side: 'L' | 'R',
+  by: Record<string, RigNode>,
+  dHumerusDeg: number,
+  constrainLimits: boolean,
+): void {
+  const sw = by['swivel' + side];
+  const br = by['brace' + side];
+  const clampedDelta = Math.max(-90, Math.min(90, normalizeDeg(dHumerusDeg)));
+  if (sw) {
+    sw.ang = clampAnatomicalAngle(sw, sw.ang + clampedDelta * 0.28, constrainLimits);
+  }
+  if (br) {
+    br.ang = clampAnatomicalAngle(br, br.ang + clampedDelta * 0.34, constrainLimits);
+  }
 }
 
 export function solveRig(
@@ -563,9 +840,18 @@ export function solveRig(
   by: Record<string, RigNode>,
   bondOn: boolean,
   wingPop = 0,
+  ribAnchor: RibAnchorMode = 'upper',
 ): void {
   const activeWings = wingPop > 0.05;
   for (const n of nodes) {
+    // Self-corrective finite guard against NaN/Infinity propagation
+    if (!Number.isFinite(n.ang)) n.ang = 0;
+    if (!Number.isFinite(n.tx)) n.tx = 0;
+    if (!Number.isFinite(n.ty)) n.ty = 0;
+    if (!Number.isFinite(n.piv[0]) || !Number.isFinite(n.piv[1])) {
+      n.piv = n.rest.slice() as [number, number];
+    }
+
     if (n.id === 'wingL' || n.id === 'wingR') {
       n.ghost = !activeWings;
       if (wingPop > 0.001 && n.parent && by[n.parent]) {
@@ -584,10 +870,17 @@ export function solveRig(
         n.piv = n.rest.slice() as [number, number];
       }
     }
+
     if (n.aim) {
       setAim(n, by, bondOn, activeWings);
     } else {
-      n.eff = bondAng(n, by, bondOn, activeWings);
+      let solvedAng = bondAng(n, by, bondOn, activeWings);
+      // Self-corrective Chungus check after thorax/swivel/acromion/brace have updated world frames
+      if (ribAnchor === 'lower' && (n.id === 'ribR' || n.id === 'ribL')) {
+        solvedAng = clampChungusRibAngle(n.id, solvedAng, 'lower', by, activeWings);
+        n.ang = solvedAng;
+      }
+      n.eff = Number.isFinite(solvedAng) ? solvedAng : 0;
       setW(n, n.eff * DEG, by);
     }
   }
@@ -621,11 +914,13 @@ export function assetTips(nodes: RigNode[]): void {
       continue;
     }
     if (n.id === 'ribR') {
-      n.at = [696, 2648];
+      const rp = n.pieces[0];
+      n.at = rp ? [rp.x, rp.y + rp.h] : [696, 2370];
       continue;
     }
     if (n.id === 'ribL') {
-      n.at = [1808, 2592];
+      const rp = n.pieces[0];
+      n.at = rp ? [rp.x + rp.w, rp.y + rp.h] : [1808, 2314];
       continue;
     }
     if (!n.pieces.length || n.aim || n.bar || nodes.some((k) => k.parent === n.id)) continue;
@@ -667,6 +962,7 @@ export function buildRigGraph(rawInput: RawRigDef, includeDigitsAndJoints = true
   if (includeDigitsAndJoints) {
     addDigits(def);
     addJoints(def);
+    applyAntiPhallicLowerSpine(def);
   }
 
   const chainLookup: Record<string, string> = {};
@@ -773,14 +1069,13 @@ export function sortPiecesForWings(pieces: RigPiece[], popped: boolean): void {
 }
 
 /**
- * Returns rigid piece world matrix. For Backshoulder ("Prometheus wing"),
- * remains locked to braceL/R when wingPop=0 and cleanly pops/flares outward when wingPop>0.
+ * Returns rigid/elastic piece world matrix. For Backshoulder ("Prometheus wing"),
+ * remains locked to braceL/R when wingPop=0 and elastically pops/flexes outward when wingPop>0.
  */
 export function getPieceWorldMatrix(
   p: RigPiece,
   wingPop = 0,
   out: Float64Array = new Float64Array(6),
-  superWings = false,
 ): Float64Array {
   const n = p.node;
   if (!n) {
@@ -792,11 +1087,12 @@ export function getPieceWorldMatrix(
     out.set(w);
     return out;
   }
-  const wingScale = superWings ? 5 : 1;
   const side = n.id === 'braceL' ? 1 : -1;
-  const flareRad = side * -32 * wingPop * DEG;
-  const c = Math.cos(flareRad) * wingScale;
-  const s = Math.sin(flareRad) * wingScale;
+  const elasticBend = Math.max(-18, Math.min(18, n.ang * 0.42)) * wingPop;
+  const flareRad = (side * -32 * wingPop + elasticBend) * DEG;
+  const chordScale = 1 + Math.max(-0.08, Math.min(0.14, Math.abs(n.ang) * 0.0028 * wingPop + (wingPop - 1) * 0.22));
+  const c = Math.cos(flareRad) * chordScale;
+  const s = Math.sin(flareRad) * chordScale;
   const px = n.piv[0];
   const py = n.piv[1];
   const tx = side * 42 * wingPop;
@@ -818,12 +1114,11 @@ export function hitTestPiece(
   q: [number, number],
   pieces: RigPiece[],
   wingPop = 0,
-  superWings = false,
 ): { node: RigNode; piece: RigPiece } | null {
   for (let k = pieces.length - 1; k >= 0; k--) {
     const p = pieces[k];
     if (!p.m || !p.node || !p.mw || !p.st) continue;
-    const w = getPieceWorldMatrix(p, wingPop, TMP_MAT, superWings);
+    const w = getPieceWorldMatrix(p, wingPop, TMP_MAT);
     const det = w[0] * w[3] - w[1] * w[2];
     if (!det) continue;
     const dx = q[0] - w[4];
@@ -838,13 +1133,13 @@ export function hitTestPiece(
   return null;
 }
 
-export function hitTest(q: [number, number], pieces: RigPiece[], wingPop = 0, superWings = false): RigNode | null {
-  return hitTestPiece(q, pieces, wingPop, superWings)?.node ?? null;
+export function hitTest(q: [number, number], pieces: RigPiece[], wingPop = 0): RigNode | null {
+  return hitTestPiece(q, pieces, wingPop)?.node ?? null;
 }
 
-export function samplePieceWorldMask(p: RigPiece, wx: number, wy: number, wingPop = 0, superWings = false): boolean {
+export function samplePieceWorldMask(p: RigPiece, wx: number, wy: number, wingPop = 0): boolean {
   if (!p.m || !p.node || !p.mw || !p.mh || !p.st) return false;
-  const w = getPieceWorldMatrix(p, wingPop, TMP_MAT, superWings);
+  const w = getPieceWorldMatrix(p, wingPop, TMP_MAT);
   const det = w[0] * w[3] - w[1] * w[2];
   if (!det) return false;
   const dx = wx - w[4];
@@ -873,25 +1168,28 @@ export function fitBoxParams(box: CameraBox, canvasW: number, canvasH: number, f
   };
 }
 
+export interface RigWorldBounds {
+  x0: number;
+  x1: number;
+  y0: number;
+  y1: number;
+  headTopY: number;
+  anklesY: number;
+}
+
 /**
- * Fits the full figure cleanly head-to-toe inside the unobstructed stage box
- * with a balanced buffer above the crown and below the feet, centered on MX = 1257 at rest.
+ * Computes the live world-space bounding box of the puppet plus exact head-top and ankle Y coordinates.
  */
-export function computeModelFrame(
+export function computeRigWorldBounds(
   by: Record<string, RigNode>,
   pieces: RigPiece[],
-  W: number,
-  H: number,
-  canvasW: number,
-  canvasH: number,
-  dpr = 1,
   wingPop = 0,
-  safeInset?: { right?: number; bottom?: number },
-): { z: number; ox: number; oy: number } {
+): RigWorldBounds | null {
   let x0 = 1e9;
   let x1 = -1e9;
   let y0 = 1e9;
   let y1 = -1e9;
+  let headTopY = 1e9;
   let hasBounds = false;
 
   for (const p of pieces) {
@@ -911,12 +1209,18 @@ export function computeModelFrame(
         x1 = Math.max(x1, wx);
         y0 = Math.min(y0, wy);
         y1 = Math.max(y1, wy);
+        if (p.node?.id === 'head') {
+          headTopY = Math.min(headTopY, wy);
+        }
       }
     } else {
       x0 = Math.min(x0, p.x);
       x1 = Math.max(x1, p.x + p.w);
       y0 = Math.min(y0, p.y);
       y1 = Math.max(y1, p.y + p.h);
+      if (p.node?.id === 'head') {
+        headTopY = Math.min(headTopY, p.y);
+      }
     }
   }
 
@@ -932,7 +1236,38 @@ export function computeModelFrame(
     }
   }
 
-  if (hasBounds && x1 > x0 && y1 > y0) {
+  if (!hasBounds || x1 <= x0 || y1 <= y0) return null;
+
+  if (headTopY > 1e8) {
+    headTopY = by.head ? pos(by.head, by)[1] - 320 : y0;
+  }
+  const footYs: number[] = [];
+  if (by.footL) footYs.push(pos(by.footL, by)[1]);
+  if (by.footR) footYs.push(pos(by.footR, by)[1]);
+  const anklesY = footYs.length ? Math.max(...footYs) : y1 - 240;
+
+  return { x0, x1, y0, y1, headTopY, anklesY };
+}
+
+/**
+ * Fits the full figure cleanly head-to-toe inside the unobstructed stage box
+ * with a balanced buffer above the crown and below the feet, centered on MX = 1257 at rest.
+ */
+export function computeModelFrame(
+  by: Record<string, RigNode>,
+  pieces: RigPiece[],
+  W: number,
+  H: number,
+  canvasW: number,
+  canvasH: number,
+  dpr = 1,
+  wingPop = 0,
+  safeInset?: { left?: number; right?: number; top?: number; bottom?: number; alwaysFitSafeBox?: boolean },
+): { z: number; ox: number; oy: number } {
+  const bounds = computeRigWorldBounds(by, pieces, wingPop);
+
+  if (bounds) {
+    const { x0, x1, y0, y1 } = bounds;
     const figH = Math.max(1, y1 - y0);
     const centerX = W === 2500 ? 1257 : (x0 + x1) / 2;
     const figW =
@@ -940,32 +1275,48 @@ export function computeModelFrame(
         ? Math.max(1, 2 * Math.max(centerX - x0, x1 - centerX))
         : Math.max(1, x1 - x0);
 
-    const fitRect = (boxW: number, boxH: number) => {
-      const topPad = Math.max(18 * dpr, boxH * 0.055);
-      const bottomPad = Math.max(18 * dpr, boxH * 0.055);
-      const sidePad = Math.max(16 * dpr, boxW * 0.04);
-      const availW = Math.max(60, boxW - 2 * sidePad);
-      const availH = Math.max(60, boxH - topPad - bottomPad);
+    const fitRect = (boxLeft: number, boxTop: number, boxW: number, boxH: number) => {
+      const topPad = Math.max(16 * dpr, boxH * 0.055);
+      const bottomPad = Math.max(16 * dpr, boxH * 0.055);
+      const sidePad = Math.max(14 * dpr, boxW * 0.04);
+      const availW = Math.max(48, boxW - 2 * sidePad);
+      const availH = Math.max(48, boxH - topPad - bottomPad);
       const z = Math.min(availW / figW, availH / figH);
-      const ox = boxW / 2 - centerX * z;
+      const ox = boxLeft + boxW / 2 - centerX * z;
       // Exact vertical centering within the buffered viewport box (equal crown & sole buffers)
-      const oy = topPad + (availH - figH * z) * 0.5 - y0 * z;
+      const oy = boxTop + topPad + (availH - figH * z) * 0.5 - y0 * z;
       return { z, ox, oy };
     };
 
-    const full = fitRect(canvasW, canvasH);
+    const safeL = Math.max(0, safeInset?.left ?? 0);
     const safeR = Math.max(0, safeInset?.right ?? 0);
+    const safeT = Math.max(0, safeInset?.top ?? 0);
     const safeB = Math.max(0, safeInset?.bottom ?? 0);
-    if (safeR > 0 || safeB > 0) {
+    const effW = Math.max(100 * dpr, canvasW - safeL - safeR);
+    const effH = Math.max(100 * dpr, canvasH - safeT - safeB);
+
+    if (safeInset?.alwaysFitSafeBox) {
+      return fitRect(safeL, safeT, effW, effH);
+    }
+
+    const full = fitRect(0, 0, canvasW, canvasH);
+    if (safeL > 0 || safeR > 0 || safeT > 0 || safeB > 0) {
       const margin = 16 * dpr;
+      const figLeft = x0 * full.z + full.ox;
       const figRight = x1 * full.z + full.ox;
+      const figTop = y0 * full.z + full.oy;
       const figBottom = y1 * full.z + full.oy;
+      const hitsLeft = safeL > 0 && figLeft < safeL + margin;
       const hitsRight = safeR > 0 && figRight > canvasW - safeR - margin;
+      const hitsTop = safeT > 0 && figTop < safeT + margin;
       const hitsBottom = safeB > 0 && figBottom > canvasH - safeB - margin;
-      if (hitsRight || hitsBottom) {
-        const effW = hitsRight ? Math.max(120 * dpr, canvasW - safeR) : canvasW;
-        const effH = hitsBottom ? Math.max(120 * dpr, canvasH - safeB) : canvasH;
-        return fitRect(effW, effH);
+      if (hitsLeft || hitsRight || hitsTop || hitsBottom) {
+        return fitRect(
+          hitsLeft ? safeL : 0,
+          hitsTop ? safeT : 0,
+          hitsLeft || hitsRight ? effW : canvasW,
+          hitsTop || hitsBottom ? effH : canvasH,
+        );
       }
     }
     return full;
@@ -982,6 +1333,62 @@ export function computeModelFrame(
     ox: fallback.ox + sidePad,
     oy: fallback.oy + topPad,
   };
+}
+
+/**
+ * Enforces the studio invariant that the puppet body can never leave the unobstructed canvas,
+ * even when panning, zooming, moving the root, or adjusting popup/panel room sliders.
+ */
+export function clampCameraToKeepBodyVisible(
+  cam: { z: number; ox: number; oy: number },
+  bounds: RigWorldBounds | null,
+  canvasW: number,
+  canvasH: number,
+  dpr = 1,
+  safeInset?: { left?: number; right?: number; top?: number; bottom?: number },
+): { z: number; ox: number; oy: number } {
+  if (!bounds || canvasW <= 0 || canvasH <= 0) return cam;
+  const margin = 10 * dpr;
+  const vL = Math.max(0, safeInset?.left ?? 0) + margin;
+  const vR = Math.max(vL + 80 * dpr, canvasW - Math.max(0, safeInset?.right ?? 0) - margin);
+  const vT = Math.max(0, safeInset?.top ?? 0) + margin;
+  const vB = Math.max(vT + 80 * dpr, canvasH - Math.max(0, safeInset?.bottom ?? 0) - margin);
+  const vW = vR - vL;
+  const vH = vB - vT;
+
+  const bwRaw = Math.max(1, bounds.x1 - bounds.x0);
+  const bhRaw = Math.max(1, bounds.y1 - bounds.y0);
+  const fitZ = Math.min(vW / bwRaw, vH / bhRaw);
+  const z = Math.max(Math.max(0.015, fitZ * 0.45), Math.min(Math.max(fitZ * 12, 2.5), cam.z));
+
+  const bw = bwRaw * z;
+  const bh = bhRaw * z;
+  let ox = cam.ox;
+  let oy = cam.oy;
+
+  if (bw <= vW) {
+    const minOx = vL - bounds.x0 * z;
+    const maxOx = vR - bounds.x1 * z;
+    ox = Math.max(minOx, Math.min(maxOx, ox));
+  } else {
+    const keepX = Math.min(vW * 0.42, 180 * dpr);
+    const minOx = vL + keepX - bounds.x1 * z;
+    const maxOx = vR - keepX - bounds.x0 * z;
+    ox = Math.max(minOx, Math.min(maxOx, ox));
+  }
+
+  if (bh <= vH) {
+    const minOy = vT - bounds.y0 * z;
+    const maxOy = vB - bounds.y1 * z;
+    oy = Math.max(minOy, Math.min(maxOy, oy));
+  } else {
+    const keepY = Math.min(vH * 0.42, 180 * dpr);
+    const minOy = vT + keepY - bounds.y1 * z;
+    const maxOy = vB - keepY - bounds.y0 * z;
+    oy = Math.max(minOy, Math.min(maxOy, oy));
+  }
+
+  return { z, ox, oy };
 }
 
 export function capturePoseSnapshot(

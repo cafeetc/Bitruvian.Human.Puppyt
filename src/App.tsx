@@ -16,19 +16,24 @@ import {
   TimelinePanel,
 } from './components/Panels';
 import { PartRigModal } from './components/PartRigModal';
-import { TopToolbar } from './components/TopToolbar';
+import { RigSystemsPanel } from './components/studio/RigSystemsPanel';
+import { StageHud } from './components/studio/StageHud';
+import { TimelineDock } from './components/studio/TimelineDock';
 import { StageRenderer, type AbcGhostItem } from './engine/canvasRenderer';
 import {
   DEG,
   applyChungusChestCavity,
   applyPoseSnapshot,
+  applyPrometheusArmCompensation,
+  applyPrometheusWingFollowFromArm,
   applyRibAnchorMode,
   buildRigGraph,
-  capturePoseSnapshot,
   clampAnatomicalAngle,
+  clampCameraToKeepBodyVisible,
   clampChungusRibAngle,
   clampRealisticShoulder,
   computeModelFrame,
+  computeRigWorldBounds,
   decImage,
   exportBskJson,
   getBondStatus,
@@ -43,8 +48,23 @@ import {
   sortPiecesForWings,
   type RibAnchorMode,
 } from './engine/fkEngine';
-import { applyGotzPreset, getGotzPoseCode } from './engine/gotzHandEngine';
-import { applySkullView, type SkullViewMode } from './engine/skullKitModels';
+import { applyGotzPreset, cloneGotzState, getGotzPoseCode } from './engine/gotzHandEngine';
+import {
+  buildCanonicalPayload,
+  createBuiltinChungusLibraryPoses,
+  mirrorPoseSide,
+  parseAndValidateRigPayload,
+  payloadToPoseSnapshot,
+  serializeRigPayload,
+  type Keyframe as CanonicalKeyframe,
+} from './engine/motionFormat';
+import {
+  HEAD_TURN_SEQUENCE,
+  applyHeadTurnStep,
+  getHeadTurnStep,
+  type HeadTurnStep,
+  type SkullViewMode,
+} from './engine/skullKitModels';
 import {
   DEFAULT_IK_CONFIG,
   FBIK_CHAIN_NODES,
@@ -52,6 +72,7 @@ import {
   PERSP_DEFAULT,
   anchorFigureOnPerspectiveShift,
   applyBalanceAndPins,
+  applyPerspectiveSpineDelta,
   captureFBIKBaseline,
   capturePoseIKSnapshot,
   enforceGroundContact,
@@ -65,6 +86,7 @@ import {
   solveLimbChain,
   syncPinsFromRig,
   type FBIKDragBaseline,
+  type PerspectiveSpineBias,
   type PoseIKSnapshot,
 } from './engine/ikEngine';
 import {
@@ -132,10 +154,11 @@ interface RigRuntime {
   bondOn: boolean;
   constrainLimits: boolean;
   prometheusWings: boolean;
-  superWings: boolean;
   ribAnchor: RibAnchorMode;
   skullView: SkullViewMode;
+  headStep: HeadTurnStep;
   wingPop: number;
+  wingVel: number;
   wingTarget: number;
   dirty: boolean;
   raf: number;
@@ -146,6 +169,7 @@ interface RigRuntime {
   frame: number;
   t0: number;
   keys: Keyframe[];
+  canonicalKeys: CanonicalKeyframe[];
   ema: number;
   hudT: number;
 }
@@ -179,13 +203,21 @@ function loadInitialPanels(): Record<PanelId, PanelLayoutState> {
 }
 
 function loadPoseLibrary(): SavedPoseEntry[] {
+  const builtins = createBuiltinChungusLibraryPoses();
   try {
     const raw = localStorage.getItem(POSE_LIBRARY_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
+    const parsed: SavedPoseEntry[] = raw ? (JSON.parse(raw) as SavedPoseEntry[]) : [];
+    const existing = Array.isArray(parsed) ? parsed : [];
+    if (!localStorage.getItem('bitruvius_chungus_seed_v1')) {
+      const existingIds = new Set(existing.map((e) => e.id));
+      const merged = [...existing, ...builtins.filter((b) => !existingIds.has(b.id))];
+      localStorage.setItem(POSE_LIBRARY_KEY, JSON.stringify(merged));
+      localStorage.setItem('bitruvius_chungus_seed_v1', '1');
+      return merged;
+    }
+    return existing;
   } catch {
-    return [];
+    return builtins;
   }
 }
 
@@ -257,6 +289,9 @@ export default function App() {
         swivel0: number;
         acro0: number;
         brace0: number;
+        humerus0: number;
+        forearm0: number;
+        hand0: number;
         snap?: PoseIKSnapshot;
       }
     | {
@@ -265,9 +300,13 @@ export default function App() {
         target0: [number, number];
         q0: [number, number];
         swiv0: number;
+        brace0: number;
         endDir0: number;
         bendHint: number;
         snap: PoseIKSnapshot;
+        snapAngles: Record<string, number>;
+        isElasticPin?: boolean;
+        pinAnchor?: [number, number];
         downX: number;
         downY: number;
       }
@@ -278,10 +317,20 @@ export default function App() {
         downX: number;
         downY: number;
       }
+    | {
+        t: 'headSwivel';
+        lastWorld: [number, number];
+        startX: number;
+        startY: number;
+        accumAlongSpineRight: number;
+        lastDir: -1 | 0 | 1;
+        swiveledSteps: number;
+      }
     | null
   >(null);
   const ikConfigRef = useRef<IKConfig>({ ...DEFAULT_IK_CONFIG });
   const perspRef = useRef<PerspectiveState>({ ...PERSP_DEFAULT });
+  const perspSpineBiasRef = useRef<PerspectiveSpineBias>({ lumbar: 0, thorax: 0 });
   const hoverPerspRef = useRef<PerspHandle>(null);
   const ikPinsRef = useRef<Record<string, IKPinEntry>>({});
   const ikOverlayRef = useRef<{
@@ -289,11 +338,13 @@ export default function App() {
     targetPos: [number, number] | null;
     holdProgress: number | null;
     holdPos: [number, number] | null;
+    elasticTethers?: Array<{ anchor: [number, number]; current: [number, number] }>;
   }>({
     activeChainIds: null,
     targetPos: null,
     holdProgress: null,
     holdPos: null,
+    elasticTethers: undefined,
   });
   const longIkTimerRef = useRef<number>(0);
   const rightClickRef = useRef<{ count: number; timer: number }>({ count: 0, timer: 0 });
@@ -307,6 +358,7 @@ export default function App() {
   const abcLoopDirRef = useRef<1 | -1>(1);
   const abcPlayTimerRef = useRef(0);
   const abcScrubRef = useRef(0);
+  const backdropDismissedRef = useRef(false);
   const sidePoseRef = useRef<'L' | 'R' | null>(null);
   const snapSpringRef = useRef<{
     fromAngles: Record<string, number>;
@@ -332,9 +384,10 @@ export default function App() {
   const [panels, setPanels] = useState<Record<PanelId, PanelLayoutState>>(loadInitialPanels);
   const [showStats, setShowStats] = useState(false);
   const [hudText, setHudText] = useState('');
-  const [hintVisible, setHintVisible] = useState(true);
   const [copyToast, setCopyToast] = useState<string | null>(null);
   const [activePart, setActivePart] = useState<PartRigInstance | null>(null);
+  const [modelSplitPct, setModelSplitPct] = useState(46);
+  const [partHeightPct, setPartHeightPct] = useState(92);
   const [abcPlaying, setAbcPlaying] = useState(false);
   const [unlockedAbcSlots, setUnlockedAbcSlots] = useState(3);
   const [savedPoses, setSavedPoses] = useState<SavedPoseEntry[]>(loadPoseLibrary);
@@ -347,17 +400,26 @@ export default function App() {
   const buildJsonString = useCallback(() => {
     const rt = rtRef.current;
     if (!rt || !partMgrRef.current) return '';
-    solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
-    const snap = capturePoseSnapshot(
+    solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, rt.ribAnchor);
+    const coordsById: Record<string, [number, number]> = {};
+    for (const n of rt.nodes) {
+      coordsById[n.id] = pos(n, rt.by);
+    }
+    const payload = buildCanonicalPayload(
       rt.nodes,
-      rt.by,
+      coordsById,
       rt.root,
-      rt.keys,
+      rt.canonicalKeys,
       partMgrRef.current.inst,
-      abcRef.current,
-      rt.prometheusWings,
+      cloneGotzState,
+      {
+        abc: abcRef.current,
+        prometheusWings: rt.prometheusWings,
+        ribAnchor: rt.ribAnchor,
+        legacyKeys: rt.keys,
+      },
     );
-    return JSON.stringify(snap);
+    return serializeRigPayload(payload);
   }, []);
 
   const syncUi = useCallback(() => {
@@ -401,6 +463,7 @@ export default function App() {
       targetPos: ov.targetPos,
       holdProgress: ov.holdProgress,
       holdPos: ov.holdPos,
+      elasticTethers: ov.elasticTethers,
     };
   }, []);
 
@@ -433,10 +496,12 @@ export default function App() {
       };
 
       const wingDiff = rt.wingTarget - rt.wingPop;
-      if (Math.abs(wingDiff) > 0.002) {
-        rt.wingPop += wingDiff * 0.24;
-        if (Math.abs(rt.wingTarget - rt.wingPop) <= 0.002) {
+      if (Math.abs(wingDiff) > 0.002 || Math.abs(rt.wingVel) > 0.002) {
+        rt.wingVel = rt.wingVel * 0.72 + wingDiff * 0.26;
+        rt.wingPop = Math.max(0, Math.min(1.22, rt.wingPop + rt.wingVel));
+        if (Math.abs(rt.wingTarget - rt.wingPop) <= 0.002 && Math.abs(rt.wingVel) <= 0.002) {
           rt.wingPop = rt.wingTarget;
+          rt.wingVel = 0;
         }
         sortPiecesForWings(rt.pieces, rt.wingPop > 0.35);
         rt.dirty = true;
@@ -556,7 +621,7 @@ export default function App() {
         const startMs = performance.now();
         try {
           partMgrRef.current?.syncLinks(rt.by, wake);
-          solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
+          solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, rt.ribAnchor);
           const ctx = cv.getContext('2d', { alpha: false });
           if (ctx) {
             rendererRef.current.render({
@@ -582,7 +647,6 @@ export default function App() {
               actUntil: rt.actUntil,
               bgColor: '#121315',
               wingPop: rt.wingPop,
-              superWings: rt.superWings,
               abcGhosts: buildAbcGhosts(),
               ikOverlay: buildIkOverlay(),
               handRGotz: partMgrRef.current?.inst.handR?.gotz,
@@ -592,6 +656,13 @@ export default function App() {
               persp: perspRef.current,
               hoverPersp: hoverPerspRef.current,
               draggingPersp: dragRef.current?.t === 'persp' ? dragRef.current.what : null,
+              hidePerspLabels: true,
+              hideBackdropText: backdropDismissedRef.current,
+              backdropWelcome: 'Welcome Bitruvius.',
+              backdropHint:
+                'Drag hands, feet, knees, or spine for FABRIK IK (Alt = pure FK) · 2× click head, hand, foot or wing · 2× right-click copies JSON',
+              safeRightPx: safeInsetRef.current.right,
+              safeBottomPx: safeInsetRef.current.bottom,
             });
           }
         } catch (err) {
@@ -607,7 +678,15 @@ export default function App() {
         }
       }
 
-      if (!!abcAnimRef.current || !!snapSpringRef.current || rt.playing || rt.dirty || live || Math.abs(rt.wingTarget - rt.wingPop) > 0.002) {
+      if (
+        !!abcAnimRef.current ||
+        !!snapSpringRef.current ||
+        rt.playing ||
+        rt.dirty ||
+        live ||
+        Math.abs(rt.wingTarget - rt.wingPop) > 0.002 ||
+        Math.abs(rt.wingVel) > 0.002
+      ) {
         rt.raf = requestAnimationFrame(loopTick);
       } else {
         setHudText(`${rt.ema.toFixed(2)} ms last frame · idle (0 CPU)`);
@@ -655,6 +734,41 @@ export default function App() {
     return next;
   }, []);
 
+  const clampRtCamera = useCallback(() => {
+    const rt = rtRef.current;
+    const cv = canvasRef.current;
+    if (!rt || !cv || cv.width <= 0 || cv.height <= 0) return;
+    solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, rt.ribAnchor);
+    const bounds = computeRigWorldBounds(rt.by, rt.pieces, rt.wingPop);
+    const inset = safeInsetRef.current;
+    const clamped = clampCameraToKeepBodyVisible(
+      { z: rt.z, ox: rt.ox, oy: rt.oy },
+      bounds,
+      cv.width,
+      cv.height,
+      rt.dpr,
+      {
+        right: inset.right * rt.dpr,
+        bottom: inset.bottom * rt.dpr,
+      },
+    );
+    rt.z = clamped.z;
+    rt.ox = clamped.ox;
+    rt.oy = clamped.oy;
+  }, []);
+
+  const syncPerspectiveSpine = useCallback(() => {
+    const rt = rtRef.current;
+    if (!rt) return;
+    perspSpineBiasRef.current = applyPerspectiveSpineDelta(
+      rt.by,
+      rt.root,
+      perspRef.current,
+      perspSpineBiasRef.current,
+      rt.constrainLimits,
+    );
+  }, []);
+
   const fitCanvas = useCallback(() => {
     const rt = rtRef.current;
     const cv = canvasRef.current;
@@ -665,7 +779,7 @@ export default function App() {
     cv.height = Math.max(1, Math.round(cv.clientHeight * dpr));
     const inset = measureSafeInset();
     if (!rt.userView) {
-      solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
+      solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, rt.ribAnchor);
       const f = computeModelFrame(rt.by, rt.pieces, rt.W, rt.H, cv.width, cv.height, dpr, rt.wingPop, {
         right: inset.right * dpr,
         bottom: inset.bottom * dpr,
@@ -674,8 +788,9 @@ export default function App() {
       rt.ox = f.ox;
       rt.oy = f.oy;
     }
+    clampRtCamera();
     wake();
-  }, [measureSafeInset, wake]);
+  }, [clampRtCamera, measureSafeInset, wake]);
 
   const loadRigDefinition = useCallback(
     (def: RawRigDef, withDigitsAndJoints: boolean) => {
@@ -701,10 +816,11 @@ export default function App() {
         bondOn: true,
         constrainLimits: prev?.constrainLimits ?? false,
         prometheusWings: false,
-        superWings: false,
         ribAnchor: 'upper',
         skullView: 'front',
+        headStep: 0,
         wingPop: 0,
+        wingVel: 0,
         wingTarget: 0,
         dirty: true,
         raf: prev?.raf ?? 0,
@@ -715,13 +831,18 @@ export default function App() {
         frame: 0,
         t0: 0,
         keys: [],
+        canonicalKeys: [],
         ema: 0,
         hudT: 0,
       };
       rtRef.current = rt;
 
       graph.pieces.forEach((p) => {
-        if (p.src && !p.gotzManaged && !(withDigitsAndJoints && p.name === 'Handkit')) {
+        if (
+          p.src &&
+          !p.gotzManaged &&
+          !(withDigitsAndJoints && (p.name === 'Handkit' || p.node?.id === 'head'))
+        ) {
           decImage(p.src)
             .then((bm) => setPieceBitmap(p, bm as CanvasImageSource & { width: number; height: number }, wake))
             .catch((er) => setHudText(`image decode failed: ${er.message}`));
@@ -798,18 +919,11 @@ export default function App() {
     return () => ro.disconnect();
   }, [dockedPanelKey, fitCanvas]);
 
-  // Keep floating panels clamped within viewport on window resize
+  // Re-frame cleanly when split popup opens, closes, or room sliders move
   useEffect(() => {
-    const onResize = () => setUiTick((t) => t + 1);
-    window.addEventListener('resize', onResize);
-    return () => window.removeEventListener('resize', onResize);
-  }, []);
-
-  // Hint auto-fade after 8s
-  useEffect(() => {
-    const timer = window.setTimeout(() => setHintVisible(false), 8000);
-    return () => window.clearTimeout(timer);
-  }, []);
+    const id = requestAnimationFrame(() => fitCanvas());
+    return () => cancelAnimationFrame(id);
+  }, [activePart, modelSplitPct, partHeightPct, fitCanvas]);
 
   const targetNode = (rt: RigRuntime | null): RigNode | null => {
     if (!rt) return null;
@@ -836,7 +950,7 @@ export default function App() {
     const rt = rtRef.current;
     const cv = canvasRef.current;
     if (!rt || !cv) return;
-    solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
+    solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, rt.ribAnchor);
     const ctx = cv.getContext('2d', { alpha: false });
     if (ctx) {
       rendererRef.current.render({
@@ -862,12 +976,13 @@ export default function App() {
         actUntil: 0,
         bgColor: '#121315',
         wingPop: rt.wingPop,
-        superWings: rt.superWings,
         handRGotz: partMgrRef.current?.inst.handR?.gotz,
         handLGotz: partMgrRef.current?.inst.handL?.gotz,
         handRProps: partMgrRef.current?.inst.handR?.propsModel,
         handLProps: partMgrRef.current?.inst.handL?.propsModel,
         persp: perspRef.current,
+        hidePerspLabels: true,
+        hideBackdropText: true,
       });
     }
     cv.toBlob((b) => {
@@ -915,9 +1030,11 @@ export default function App() {
       const mgr = partMgrRef.current;
       if (!rt || !mgr) return;
       try {
-        const parsed = JSON.parse(rawStr) as Partial<PoseSnapshot>;
+        const payload = parseAndValidateRigPayload(rawStr);
+        const parsed = payloadToPoseSnapshot(payload);
         const loadedKeys = applyPoseSnapshot(parsed, rt.nodes, rt.root, mgr.inst, (I) => mgr.rebake(I, wake));
         if (loadedKeys) rt.keys = loadedKeys;
+        rt.canonicalKeys = payload.keys;
         if (parsed.abc) {
           const base = createDefaultAbcState();
           abcRef.current = {
@@ -938,16 +1055,25 @@ export default function App() {
           );
           setUnlockedAbcSlots((prev) => Math.min(5, Math.max(prev, maxFilled)));
         }
+        const nextRibAnchor: RibAnchorMode = payload.ribAnchor ?? 'upper';
+        rt.ribAnchor = nextRibAnchor;
         if (typeof parsed.prometheusWings === 'boolean') {
           rt.prometheusWings = parsed.prometheusWings;
           rt.wingTarget = parsed.prometheusWings ? 1 : 0;
           rt.wingPop = rt.wingTarget;
+          rt.wingVel = 0;
           sortPiecesForWings(rt.pieces, rt.prometheusWings);
         } else {
           rt.prometheusWings = false;
           rt.wingTarget = 0;
           rt.wingPop = 0;
+          rt.wingVel = 0;
           sortPiecesForWings(rt.pieces, false);
+        }
+        applyRibAnchorMode(rt.by, nextRibAnchor, rt.prometheusWings);
+        if (nextRibAnchor === 'lower') {
+          solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, nextRibAnchor);
+          applyChungusChestCavity(rt.by, rt.prometheusWings, rt.prometheusWings);
         }
         if (!rt.prometheusWings) {
           rt.nodes.forEach((n) => {
@@ -958,6 +1084,7 @@ export default function App() {
         snapSpringRef.current = null;
         benchmarkMsgRef.current = false;
         jsonEditingRef.current = false;
+        rt.headStep = getHeadTurnStep(rt.skullView, !!rt.by.head?.flipX);
         ikPinsRef.current = syncPinsFromRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, ikPinsRef.current);
         syncUi();
         wake();
@@ -1095,6 +1222,9 @@ export default function App() {
       rt.prometheusWings = wingsOn;
       rt.wingTarget = wingsOn ? 1 : 0;
       rt.wingPop = rt.wingTarget;
+      rt.wingVel = 0;
+      rt.ribAnchor = 'upper';
+      applyRibAnchorMode(rt.by, 'upper', wingsOn);
       sortPiecesForWings(rt.pieces, wingsOn);
       if (!wingsOn) {
         rt.nodes.forEach((n) => {
@@ -1104,13 +1234,14 @@ export default function App() {
       sidePoseRef.current = null;
       snapSpringRef.current = null;
       ikPinsRef.current = syncPinsFromRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, ikPinsRef.current);
+      clampRtCamera();
       syncUi();
       wake();
       window.clearTimeout(copyToastTimerRef.current);
       setCopyToast(`Applied "${entry.name}"`);
       copyToastTimerRef.current = window.setTimeout(() => setCopyToast(null), 1500);
     },
-    [stopAbcLoop, syncUi, wake],
+    [clampRtCamera, stopAbcLoop, syncUi, wake],
   );
 
   const handleLoadLibraryPoseToSlot = useCallback(
@@ -1130,6 +1261,9 @@ export default function App() {
       rt.prometheusWings = wingsOn;
       rt.wingTarget = wingsOn ? 1 : 0;
       rt.wingPop = rt.wingTarget;
+      rt.wingVel = 0;
+      rt.ribAnchor = 'upper';
+      applyRibAnchorMode(rt.by, 'upper', wingsOn);
       sortPiecesForWings(rt.pieces, wingsOn);
       if (!wingsOn) {
         rt.nodes.forEach((n) => {
@@ -1138,6 +1272,7 @@ export default function App() {
       }
       sidePoseRef.current = null;
       snapSpringRef.current = null;
+      clampRtCamera();
       syncUi();
       wake();
       window.clearTimeout(copyToastTimerRef.current);
@@ -1314,6 +1449,11 @@ export default function App() {
       const step = e.shiftKey ? 5 : 1;
 
       if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        if (tgt.id === 'lip' || tgt.id === 'chinTip') {
+          if (rt.by.lip) rt.by.lip.ang = 0;
+          stepHeadTurn(e.key === 'ArrowRight' ? 1 : -1);
+          return;
+        }
         const nextDeg = e.key === 'ArrowLeft' ? tgt.ang - step : tgt.ang + step;
         tgt.ang = clampAnatomicalAngle(
           tgt,
@@ -1321,13 +1461,15 @@ export default function App() {
             tgt.id,
             clampRealisticShoulder(tgt, nextDeg, rt.by, rt.prometheusWings),
             rt.ribAnchor,
+            rt.by,
+            rt.prometheusWings,
           ),
           rt.constrainLimits,
         );
         if (rt.ribAnchor === 'lower' && (tgt.id === 'ribR' || tgt.id === 'ribL')) {
           const oppRib = rt.by[tgt.id === 'ribR' ? 'ribL' : 'ribR'];
           if (oppRib) {
-            oppRib.ang = clampChungusRibAngle(oppRib.id, -tgt.ang, 'lower');
+            oppRib.ang = clampChungusRibAngle(oppRib.id, -tgt.ang, 'lower', rt.by, rt.prometheusWings);
           }
         }
       } else if (e.key === ' ') {
@@ -1360,7 +1502,7 @@ export default function App() {
         if (!rt) return;
         const nextMode: RibAnchorMode = rt.ribAnchor === 'ribwings' ? 'upper' : 'ribwings';
         rt.ribAnchor = nextMode;
-        applyRibAnchorMode(rt.by, nextMode);
+        applyRibAnchorMode(rt.by, nextMode, rt.prometheusWings);
         window.clearTimeout(copyToastTimerRef.current);
         setCopyToast(nextMode === 'ribwings' ? 'Rib anchor · Ribwings (Neck)' : 'Rib anchor · Upper Spine');
         copyToastTimerRef.current = window.setTimeout(() => setCopyToast(null), 1500);
@@ -1376,13 +1518,14 @@ export default function App() {
     };
   }, [fitCanvas, handleCaptureAbcSlot, handleToggleAbcLoop, syncUi, wake]);
 
-  const cycleSkullView = useCallback(
-    (explicit?: SkullViewMode) => {
+  const setHeadTurnStepExplicit = useCallback(
+    (step: HeadTurnStep) => {
       const rt = rtRef.current;
       if (!rt || !rt.by.head) return;
-      const order: SkullViewMode[] = ['front', 'side', 'back'];
-      const next = explicit ?? order[(order.indexOf(rt.skullView) + 1) % order.length];
-      rt.skullView = next;
+      const norm = (((step % 4) + 4) % 4) as HeadTurnStep;
+      const spec = HEAD_TURN_SEQUENCE[norm];
+      rt.headStep = norm;
+      rt.skullView = spec.view;
       anchorFigureOnPerspectiveShift(
         rt.nodes,
         rt.by,
@@ -1390,41 +1533,57 @@ export default function App() {
         rt.bondOn,
         rt.wingPop,
         ikConfigRef.current.groundY,
-        () => applySkullView(rt.by.head, next, wake),
+        () => {
+          applyHeadTurnStep(rt.by.head, norm, wake);
+          if (rt.by.lip) rt.by.lip.ang = 0;
+        },
       );
       window.clearTimeout(copyToastTimerRef.current);
-      setCopyToast(`Skull model · ${next.charAt(0).toUpperCase() + next.slice(1)}`);
-      copyToastTimerRef.current = window.setTimeout(() => setCopyToast(null), 1500);
+      setCopyToast(`Skull 360° · ${spec.label}`);
+      copyToastTimerRef.current = window.setTimeout(() => setCopyToast(null), 1400);
       syncUi();
       wake();
     },
     [syncUi, wake],
   );
 
+  const stepHeadTurn = useCallback(
+    (dir: -1 | 1) => {
+      const rt = rtRef.current;
+      if (!rt) return;
+      const next = (((rt.headStep + dir) % 4) + 4) % 4 as HeadTurnStep;
+      setHeadTurnStepExplicit(next);
+    },
+    [setHeadTurnStepExplicit],
+  );
+
   const openPartForNode = useCallback(
     (node: RigNode) => {
       const mgr = partMgrRef.current;
       if (!mgr) return;
-      // Head switches between Front, Side & Back skull models (Yorrick deactivated)
+      // Head steps cleanly through the 4 cardinal 360° skull poses
       if (node.id === 'head' || node.id === 'lip' || node.id === 'chinTip') {
-        cycleSkullView();
+        stepHeadTurn(1);
         return;
       }
-      // Piggy foot sub-rig deactivated for now
-      if (node.id === 'footR' || node.id === 'footL' || node.id === 'toeR' || node.id === 'toeL') {
-        return;
-      }
+      const mappedId =
+        node.id.startsWith('thumb') || node.id.startsWith('finger')
+          ? 'hand' + (node.id.endsWith('L') ? 'L' : 'R')
+          : node.id.startsWith('toe')
+          ? 'foot' + (node.id.endsWith('L') ? 'L' : 'R')
+          : node.id;
       const I =
+        mgr.inst[mappedId] ||
         mgr.inst[node.id] ||
-        (node.parent ? mgr.inst[node.parent] : undefined) ||
-        (node.id.startsWith('thumb') || node.id.startsWith('finger')
-          ? mgr.inst['hand' + (node.id.endsWith('L') ? 'L' : 'R')]
-          : undefined);
-      if (I && I.key === 'hand') {
+        (node.parent ? mgr.inst[node.parent] : undefined);
+      if (I && (I.key === 'hand' || I.key === 'foot')) {
+        if (I.key === 'foot') {
+          void mgr.loadPartAssets('foot').then(wake);
+        }
         setActivePart(I);
       }
     },
-    [cycleSkullView],
+    [stepHeadTurn, wake],
   );
 
   const isSwivelId = (id: string) =>
@@ -1582,6 +1741,7 @@ export default function App() {
         n.id === 'hipL' ||
         n.id === 'ribR' ||
         n.id === 'ribL' ||
+        n.id === 'chinTip' ||
         n.id.startsWith('thumb') ||
         n.id.startsWith('finger')
       ) {
@@ -1601,7 +1761,7 @@ export default function App() {
     if (best) return { node: best, piece: null };
 
     // 2. Pixel hit-test on sprites (defer Shoulderswivel if too close to primary spine/shoulder joints)
-    const hit = hitTestPiece(q, rt.pieces, rt.wingPop, rt.superWings);
+    const hit = hitTestPiece(q, rt.pieces, rt.wingPop);
     if (hit) {
       if (hit.piece.name === 'Shoulderswivel') {
         const minPrimaryDist = (30 * rt.dpr) / rt.z;
@@ -1678,12 +1838,14 @@ export default function App() {
     (chain: LimbChainDef, effectorNode: RigNode, q: [number, number], clientX: number, clientY: number) => {
       const rt = rtRef.current;
       if (!rt) return;
-      solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
+      solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, rt.ribAnchor);
       const U = rt.by[chain.upper];
       const L = rt.by[chain.lower];
       const E = rt.by[chain.effector] ?? effectorNode;
       if (!U || !L || !E) return;
       const swiv = chain.swiv ? rt.by[chain.swiv] : undefined;
+      const braceSide = chain.id === 'armL' ? 'braceL' : chain.id === 'armR' ? 'braceR' : null;
+      const br = braceSide ? rt.by[braceSide] : undefined;
       const tipNode = tipNodeForEffector(E.id, rt.by);
       const target0 = pos(E, rt.by);
       const endDir0 = getWorldDir(E, tipNode ? tipNode.piv : null, rt.by);
@@ -1703,15 +1865,29 @@ export default function App() {
           ? -1
           : 1;
 
+      const snapAngles: Record<string, number> = {};
+      rt.nodes.forEach((n) => {
+        snapAngles[n.id] = n.ang;
+      });
+      const cfg = ikConfigRef.current;
+      const isElasticPin = cfg.mode === 'pinFull' && cfg.elasticPinFull;
+      const pinAnchor: [number, number] | undefined = isElasticPin
+        ? [...(ikPinsRef.current[E.id]?.pos ?? target0)] as [number, number]
+        : undefined;
+
       dragRef.current = {
         t: 'limbIk',
         chain,
         target0,
         q0: [q[0], q[1]],
         swiv0: swiv?.ang ?? 0,
+        brace0: br?.ang ?? 0,
         endDir0,
         bendHint,
         snap: capturePoseIKSnapshot(rt.nodes, rt.by, rt.root, rt.bondOn, rt.wingPop),
+        snapAngles,
+        isElasticPin,
+        pinAnchor,
         downX: clientX,
         downY: clientY,
       };
@@ -1719,6 +1895,7 @@ export default function App() {
         ? [chain.swiv, chain.upper, chain.lower, chain.effector]
         : [chain.upper, chain.lower, chain.effector];
       ikOverlayRef.current.targetPos = [target0[0], target0[1]];
+      ikOverlayRef.current.elasticTethers = undefined;
       if (canvasRef.current) canvasRef.current.style.cursor = 'grab';
       wake();
     },
@@ -1826,7 +2003,6 @@ export default function App() {
   );
 
   const handleCanvasPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    setHintVisible(false);
     clearLongIkTimer();
     const rt = rtRef.current;
     const cv = canvasRef.current;
@@ -1842,26 +2018,13 @@ export default function App() {
 
     stopAbcLoop();
     snapSpringRef.current = null;
-    solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
+    solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, rt.ribAnchor);
     const q = toWorld(e);
 
-    const pPre = hitPerspHandle(q, perspRef.current, { z: rt.z, ox: rt.ox, oy: rt.oy, dpr: rt.dpr });
-    if (pPre === 'vp') {
-      dragRef.current = {
-        t: 'persp',
-        what: 'vp',
-        q0: q,
-        vpX0: perspRef.current.vpX,
-        h0: perspRef.current.horizonY,
-        g0: perspRef.current.groundY,
-      };
-      cv.style.cursor = 'ew-resize';
-      wake();
-      return;
-    }
-
+    // Zero-friction hit order: Puppet joints ALWAYS beat perspective handles
     const picked = pickAtWorldPoint(q, rt);
-    if (!picked && (pPre === 'horizon' || pPre === 'ground')) {
+    const pPre = hitPerspHandle(q, perspRef.current, { z: rt.z, ox: rt.ox, oy: rt.oy, dpr: rt.dpr });
+    if (!picked && pPre) {
       dragRef.current = {
         t: 'persp',
         what: pPre,
@@ -1870,7 +2033,7 @@ export default function App() {
         h0: perspRef.current.horizonY,
         g0: perspRef.current.groundY,
       };
-      cv.style.cursor = 'ns-resize';
+      cv.style.cursor = pPre === 'vp' ? 'ew-resize' : 'ns-resize';
       wake();
       return;
     }
@@ -1880,6 +2043,21 @@ export default function App() {
     }
     syncUi();
     wake();
+
+    if (rt.sel.id === 'lip' || rt.sel.id === 'chinTip') {
+      if (rt.by.lip) rt.by.lip.ang = 0;
+      dragRef.current = {
+        t: 'headSwivel',
+        lastWorld: [q[0], q[1]],
+        startX: e.clientX,
+        startY: e.clientY,
+        accumAlongSpineRight: 0,
+        lastDir: 0,
+        swiveledSteps: 0,
+      };
+      cv.style.cursor = 'ew-resize';
+      return;
+    }
 
     const ikCfg = ikConfigRef.current;
     const allowIk = ikCfg.mode !== 'fk' && !e.altKey;
@@ -1904,7 +2082,7 @@ export default function App() {
         }
       }
       if (onUpperRound && femur) {
-        solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
+        solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, rt.ribAnchor);
         const spineBase = pos(rt.by.pelvis ?? rt.root, rt.by);
         const spineDivInit = rt.by.lumbar?.ang ?? 0;
         const curSideInit = (hipSide === 'R' ? -1 : 1) * (hipNode.flipX ? -1 : 1);
@@ -1957,6 +2135,9 @@ export default function App() {
       const swivel = rt.by['swivel' + side];
       const acromion = rt.by['acromion' + side];
       const brace = rt.by['brace' + side];
+      const humerus = rt.by['humerus' + side];
+      const forearm = rt.by['forearm' + side];
+      const hand = rt.by['hand' + side];
       if (swivel && acromion && brace) {
         const swPos = pos(swivel, rt.by);
         const neckPos = pos(brace, rt.by);
@@ -1969,6 +2150,9 @@ export default function App() {
           swivel0: swivel.ang,
           acro0: acromion.ang,
           brace0: brace.ang,
+          humerus0: humerus?.ang ?? 0,
+          forearm0: forearm?.ang ?? 0,
+          hand0: hand?.ang ?? 0,
           snap: allowIk ? capturePoseIKSnapshot(rt.nodes, rt.by, rt.root, rt.bondOn, rt.wingPop) : undefined,
         };
         return;
@@ -2032,25 +2216,17 @@ export default function App() {
 
     const drag = dragRef.current;
     if (!drag) {
-      solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
+      solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, rt.ribAnchor);
       const q = toWorld(e);
-      const pH = hitPerspHandle(q, perspRef.current, { z: rt.z, ox: rt.ox, oy: rt.oy, dpr: rt.dpr });
-      if (pH === 'vp') {
-        if (hoverPerspRef.current !== 'vp' || rt.hov) {
-          hoverPerspRef.current = 'vp';
-          rt.hov = null;
-          cv.style.cursor = 'ew-resize';
-          repaint();
-        }
-        return;
-      }
       const picked = pickAtWorldPoint(q, rt);
       const best = picked?.node ?? null;
-      const nextPersp: PerspHandle = !best && (pH === 'horizon' || pH === 'ground') ? pH : null;
+      const pH = hitPerspHandle(q, perspRef.current, { z: rt.z, ox: rt.ox, oy: rt.oy, dpr: rt.dpr });
+      const nextPersp: PerspHandle = !best && pH ? pH : null;
       if (best !== rt.hov || nextPersp !== hoverPerspRef.current) {
         rt.hov = best;
         hoverPerspRef.current = nextPersp;
-        cv.style.cursor = nextPersp ? 'ns-resize' : best ? 'pointer' : 'crosshair';
+        cv.style.cursor =
+          nextPersp === 'vp' ? 'ew-resize' : nextPersp ? 'ns-resize' : best ? 'pointer' : 'crosshair';
         repaint();
       }
       return;
@@ -2060,11 +2236,48 @@ export default function App() {
       const d = cv.width / cv.getBoundingClientRect().width;
       rt.ox = drag.ox + (e.clientX - drag.x) * d;
       rt.oy = drag.oy + (e.clientY - drag.y) * d;
+      clampRtCamera();
       wake();
       return;
     }
 
     const q = toWorld(e);
+    if (drag.t === 'headSwivel') {
+      // Determine drag direction perpendicular to the live upper-to-neck spine axis
+      const spBase = rt.by.thorax ? pos(rt.by.thorax, rt.by) : rt.by.pelvis ? pos(rt.by.pelvis, rt.by) : [1257, 2377.5];
+      const spTop = rt.by.neck ? pos(rt.by.neck, rt.by) : rt.by.head ? pos(rt.by.head, rt.by) : [1257, 1327];
+      const spDx = spTop[0] - spBase[0];
+      const spDy = spTop[1] - spBase[1];
+      const spLen = Math.hypot(spDx, spDy) || 1;
+      const rx = -spDy / spLen;
+      const ry = spDx / spLen;
+      const projDelta = (q[0] - drag.lastWorld[0]) * rx + (q[1] - drag.lastWorld[1]) * ry;
+      drag.lastWorld = [q[0], q[1]];
+      if (rt.by.lip) rt.by.lip.ang = 0;
+
+      const STEP_WORLD = 115;
+      if (projDelta > 1 && drag.lastDir === -1 && drag.accumAlongSpineRight < -STEP_WORLD * 0.35) {
+        drag.accumAlongSpineRight = -STEP_WORLD * 0.35;
+      } else if (projDelta < -1 && drag.lastDir === 1 && drag.accumAlongSpineRight > STEP_WORLD * 0.35) {
+        drag.accumAlongSpineRight = STEP_WORLD * 0.35;
+      }
+      drag.accumAlongSpineRight += projDelta;
+
+      while (drag.accumAlongSpineRight >= STEP_WORLD) {
+        drag.accumAlongSpineRight -= STEP_WORLD;
+        drag.lastDir = 1;
+        drag.swiveledSteps++;
+        stepHeadTurn(1);
+      }
+      while (drag.accumAlongSpineRight <= -STEP_WORLD) {
+        drag.accumAlongSpineRight += STEP_WORLD;
+        drag.lastDir = -1;
+        drag.swiveledSteps++;
+        stepHeadTurn(-1);
+      }
+      return;
+    }
+
     if (drag.t === 'persp') {
       if (drag.what === 'vp') {
         perspRef.current.vpX = drag.vpX0 + (q[0] - drag.q0[0]);
@@ -2074,6 +2287,7 @@ export default function App() {
         perspRef.current.groundY = Math.max(perspRef.current.horizonY - 900, Math.min(rt.H + 1400, drag.g0 + (q[1] - drag.q0[1])));
         ikConfigRef.current = { ...ikConfigRef.current, groundY: perspRef.current.groundY };
       }
+      syncPerspectiveSpine();
       syncUi();
       wake();
       return;
@@ -2082,10 +2296,20 @@ export default function App() {
     const ikCfg = ikConfigRef.current;
 
     if (drag.t === 'limbIk') {
-      const targetRaw: [number, number] = [
+      let targetRaw: [number, number] = [
         drag.target0[0] + (q[0] - drag.q0[0]),
         drag.target0[1] + (q[1] - drag.q0[1]),
       ];
+      if (drag.isElasticPin && drag.pinAnchor) {
+        const ax = drag.pinAnchor[0];
+        const ay = drag.pinAnchor[1];
+        const px = targetRaw[0] - ax;
+        const py = targetRaw[1] - ay;
+        const dist = Math.hypot(px, py);
+        const maxStretch = 360;
+        const stretch = dist > 1e-4 ? maxStretch * Math.tanh(dist / maxStretch) : 0;
+        targetRaw = dist > 1e-4 ? [ax + (px / dist) * stretch, ay + (py / dist) * stretch] : [ax, ay];
+      }
       const target: [number, number] =
         ikCfg.footGravity && drag.chain.id.startsWith('leg')
           ? [targetRaw[0], Math.min(ikCfg.groundY, targetRaw[1])]
@@ -2100,14 +2324,21 @@ export default function App() {
         if (swiv && !swiv.lock) {
           swiv.ang = drag.swiv0;
         }
-        solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
+        const armSideBrace = drag.chain.id === 'armL' ? rt.by.braceL : drag.chain.id === 'armR' ? rt.by.braceR : undefined;
+        if (armSideBrace && rt.prometheusWings) {
+          armSideBrace.ang = drag.brace0;
+        }
+        solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, rt.ribAnchor);
 
-        // Optional shoulder clavicle swivel follow when reaching outward
-        if (swiv && !swiv.lock && ikCfg.swivelFollow > 0.001) {
+        // Optional shoulder clavicle swivel follow (amplified elastically when Prometheus wings are active)
+        const effSwivelFollow = rt.prometheusWings && drag.chain.id.startsWith('arm')
+          ? Math.max(0.58, Math.min(1, ikCfg.swivelFollow * 1.45))
+          : ikCfg.swivelFollow;
+        if (swiv && !swiv.lock && effSwivelFollow > 0.001) {
           const [L1, L2] = limbLengths(drag.chain, rt.by);
           const hardMax = L1 + L2 - 4;
           const effSoft = (L1 + L2) * Math.max(0.05, Math.min(0.28, ikCfg.softness));
-          const softSwivStart = hardMax - effSoft * 0.55;
+          const softSwivStart = rt.prometheusWings ? hardMax * 0.48 : hardMax - effSoft * 0.55;
           const S = pos(U, rt.by);
           const distST = Math.hypot(target[0] - S[0], target[1] - S[1]);
           if (distST > softSwivStart) {
@@ -2131,14 +2362,21 @@ export default function App() {
                   ? a1
                   : a2;
             }
-            const rawW = Math.min(1, (distST - softSwivStart) / (effSoft * 0.55 + 1e-6));
-            const swivWeight = rawW * rawW * (3 - 2 * rawW) * ikCfg.swivelFollow;
+            const rawW = Math.min(1, (distST - softSwivStart) / (Math.max(1, hardMax - softSwivStart) + 1e-6));
+            const swivWeight = rawW * rawW * (3 - 2 * rawW) * effSwivelFollow;
             const delta = normalizeDeg((desiredScreen - angCS) / DEG) * swivWeight;
             swiv.ang = clampAnatomicalAngle(
               swiv,
               clampRealisticShoulder(swiv, drag.swiv0 + sgnS * delta, rt.by, rt.prometheusWings),
               rt.constrainLimits,
             );
+            if (armSideBrace && rt.prometheusWings) {
+              armSideBrace.ang = clampAnatomicalAngle(
+                armSideBrace,
+                drag.brace0 + sgnS * delta * 0.72,
+                rt.constrainLimits,
+              );
+            }
           }
         }
 
@@ -2162,15 +2400,20 @@ export default function App() {
         if (tipNode) {
           setWorldDirExact(E, tipNode.piv, drag.endDir0, rt.by);
           E.ang = clampAnatomicalAngle(E, E.ang, rt.constrainLimits);
-          solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
+          solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, rt.ribAnchor);
         }
 
         const ePos = pos(E, rt.by);
-        ikPinsRef.current[E.id] = {
-          pos: [ePos[0], ePos[1]],
-          endDir: drag.endDir0,
-          pinned: !!ikPinsRef.current[E.id]?.pinned,
-        };
+        if (drag.isElasticPin && drag.pinAnchor) {
+          ikOverlayRef.current.elasticTethers = [{ anchor: drag.pinAnchor, current: [ePos[0], ePos[1]] }];
+        } else {
+          ikPinsRef.current[E.id] = {
+            pos: [ePos[0], ePos[1]],
+            endDir: drag.endDir0,
+            pinned: !!ikPinsRef.current[E.id]?.pinned,
+          };
+          ikOverlayRef.current.elasticTethers = undefined;
+        }
         applyBalanceAndPins(
           E.id,
           drag.snap,
@@ -2203,6 +2446,10 @@ export default function App() {
         ikPinsRef.current,
         rt.constrainLimits,
       );
+      if (drag.baseline.fbNodeId === 'pelvis' || drag.baseline.fbNodeId === 'lumbar') {
+        syncPerspectiveSpine();
+        clampRtCamera();
+      }
       if (chainIds.length) {
         drag.activeChainIds = chainIds;
         ikOverlayRef.current.activeChainIds = chainIds;
@@ -2214,7 +2461,7 @@ export default function App() {
     }
 
     if (drag.t === 'hipSwivel') {
-      solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
+      solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, rt.ribAnchor);
       const hip = rt.by['hip' + drag.side];
       const femur = rt.by['femur' + drag.side];
       const shin = rt.by['shin' + drag.side];
@@ -2261,13 +2508,13 @@ export default function App() {
             legChain.bendSign,
           );
           if (foot && toeNode && drag.footWorldDir0 !== null) {
-            solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
+            solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, rt.ribAnchor);
             setWorldDirExact(foot, toeNode.piv, drag.footWorldDir0, rt.by);
           }
         };
 
         const computeAnkleTargetBeforeShift = (): [number, number] | null => {
-          solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
+          solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, rt.ribAnchor);
           const anNode = foot ?? shin;
           if (!anNode) return null;
           const feB = pos(femur, rt.by);
@@ -2284,7 +2531,7 @@ export default function App() {
         const snapFemurToAnkleTarget = (target: [number, number] | null) => {
           const anNode = foot ?? shin;
           if (!target || !anNode) return;
-          solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
+          solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, rt.ribAnchor);
           const feA = pos(femur, rt.by);
           const anA = pos(anNode, rt.by);
           const curDir = Math.atan2(anA[1] - feA[1], anA[0] - feA[0]);
@@ -2363,7 +2610,7 @@ export default function App() {
 
           // Check if femur has continued upward past the upper spine (thorax -> neck); if so, switch hip cleanly
           if (outwardDeg > 135 && shin && rt.by.thorax && rt.by.neck) {
-            solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
+            solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, rt.ribAnchor);
             const th = pos(rt.by.thorax, rt.by);
             const nk = pos(rt.by.neck, rt.by);
             const fe = pos(femur, rt.by);
@@ -2427,7 +2674,7 @@ export default function App() {
     }
 
     if (drag.t === 'shoulder') {
-      solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
+      solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, rt.ribAnchor);
       const swivel = rt.by['swivel' + drag.side];
       const acromion = rt.by['acromion' + drag.side];
       const brace = rt.by['brace' + drag.side];
@@ -2486,8 +2733,7 @@ export default function App() {
             rt.constrainLimits,
           );
         } else {
-          brace.ang = clampAnatomicalAngle(brace, drag.brace0 + dNeck, rt.constrainLimits);
-          swivel.ang = clampAnatomicalAngle(swivel, drag.swivel0 + dSwivel * 0.25, rt.constrainLimits);
+          applyPrometheusArmCompensation(drag.side, rt.by, drag, dSwivel, dNeck, rt.constrainLimits);
         }
         if (ikCfg.mode !== 'fk') {
           applyBalanceAndPins(
@@ -2516,7 +2762,7 @@ export default function App() {
     }
 
     if (rt.sel.lock && rt.sel.parent) {
-      solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
+      solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, rt.ribAnchor);
       const par = rt.by[rt.sel.parent];
       const gp = parentOf(par, rt.by);
       const gpw = gp ? gp.w : [1, 0, 0, 1, 0, 0];
@@ -2534,7 +2780,7 @@ export default function App() {
       return;
     }
 
-    solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
+    solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, rt.ribAnchor);
     const pp = pos(rt.sel, rt.by);
     const curAng = Math.atan2(q[1] - pp[1], q[0] - pp[0]);
     const stepDelta = normalizeDeg(((curAng - drag.s) / DEG) * drag.parDetSign);
@@ -2549,6 +2795,7 @@ export default function App() {
       const inwardSign = isRightArm ? -1 : 1; // R swings inward with -ang, L swings inward with +ang
       const snapSide: 'R' | 'L' = isRightArm ? 'R' : 'L';
       const curSide = sidePoseRef.current;
+      const prevHumerusAng = rt.sel.ang;
 
       if (curSide === null) {
         const inwardDeg = rawIntent * inwardSign;
@@ -2566,11 +2813,20 @@ export default function App() {
           visualAng = inwardSign * slowed;
         }
         rt.sel.ang = clampAnatomicalAngle(rt.sel, visualAng, rt.constrainLimits);
-        // Subtle elastic shoulder pre-load follow while pushing against the resistance
-        const sw = rt.by['swivel' + (isRightArm ? 'R' : 'L')];
-        if (sw && inwardDeg > 14) {
-          const tension = Math.min(1, (inwardDeg - 14) / 31);
-          sw.ang = clampRealisticShoulder(sw, inwardSign * -10 * tension, rt.by, rt.prometheusWings);
+        if (rt.prometheusWings) {
+          applyPrometheusWingFollowFromArm(
+            snapSide,
+            rt.by,
+            normalizeDeg(rt.sel.ang - prevHumerusAng),
+            rt.constrainLimits,
+          );
+        } else {
+          // Subtle elastic shoulder pre-load follow while pushing against the resistance
+          const sw = rt.by['swivel' + snapSide];
+          if (sw && inwardDeg > 14) {
+            const tension = Math.min(1, (inwardDeg - 14) / 31);
+            sw.ang = clampRealisticShoulder(sw, inwardSign * -10 * tension, rt.by, false);
+          }
         }
         syncUi();
         wake();
@@ -2592,6 +2848,14 @@ export default function App() {
         visualAng = normalizeDeg(drag.a0 + (curSide === 'R' ? resistStep : -resistStep));
       }
       rt.sel.ang = clampAnatomicalAngle(rt.sel, visualAng, rt.constrainLimits);
+      if (rt.prometheusWings) {
+        applyPrometheusWingFollowFromArm(
+          snapSide,
+          rt.by,
+          normalizeDeg(rt.sel.ang - prevHumerusAng),
+          rt.constrainLimits,
+        );
+      }
       syncUi();
       wake();
       return;
@@ -2603,13 +2867,15 @@ export default function App() {
         rt.sel.id,
         clampRealisticShoulder(rt.sel, rawIntent, rt.by, rt.prometheusWings),
         rt.ribAnchor,
+        rt.by,
+        rt.prometheusWings,
       ),
       rt.constrainLimits,
     );
     if (rt.ribAnchor === 'lower' && (rt.sel.id === 'ribR' || rt.sel.id === 'ribL')) {
       const oppRib = rt.by[rt.sel.id === 'ribR' ? 'ribL' : 'ribR'];
       if (oppRib) {
-        oppRib.ang = clampChungusRibAngle(oppRib.id, -rt.sel.ang, 'lower');
+        oppRib.ang = clampChungusRibAngle(oppRib.id, -rt.sel.ang, 'lower', rt.by, rt.prometheusWings);
       }
     }
     if (ikCfg.mode !== 'fk') {
@@ -2629,7 +2895,7 @@ export default function App() {
     wake();
   };
 
-  const handleCanvasPointerUp = () => {
+  const handleCanvasPointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
     clearLongIkTimer();
     const prevDrag = dragRef.current;
     dragRef.current = null;
@@ -2638,17 +2904,42 @@ export default function App() {
       targetPos: null,
       holdProgress: null,
       holdPos: null,
+      elasticTethers: undefined,
     };
     const rt = rtRef.current;
+    if (prevDrag?.t === 'headSwivel') {
+      if (rt?.by.lip) rt.by.lip.ang = 0;
+      const movedPx = Math.hypot(e.clientX - prevDrag.startX, e.clientY - prevDrag.startY);
+      if (prevDrag.swiveledSteps === 0 && movedPx < 8) {
+        stepHeadTurn(1);
+      }
+    }
     if (prevDrag?.t === 'persp' && prevDrag.what === 'ground' && rt && ikConfigRef.current.footGravity) {
       enforceGroundContact(rt.nodes, rt.by, rt.root, rt.bondOn, rt.wingPop, ikConfigRef.current.groundY, false);
     }
+
+    const wasElasticPinDrag = prevDrag?.t === 'limbIk' && !!prevDrag.isElasticPin;
+    if (wasElasticPinDrag && prevDrag && rt) {
+      const fromAngles: Record<string, number> = {};
+      rt.nodes.forEach((n) => {
+        fromAngles[n.id] = n.ang;
+      });
+      snapSpringRef.current = {
+        fromAngles,
+        toAngles: { ...prevDrag.snapAngles },
+        t0: performance.now(),
+        dur: 380,
+      };
+      wake();
+    } else {
+      syncAllPinsToRig();
+    }
+
     if (canvasRef.current) {
       const hp = hoverPerspRef.current;
       canvasRef.current.style.cursor =
         hp === 'vp' ? 'ew-resize' : hp ? 'ns-resize' : rt?.hov ? 'pointer' : 'crosshair';
     }
-    syncAllPinsToRig();
     syncUi();
     repaint();
   };
@@ -2666,6 +2957,7 @@ export default function App() {
     rt.ox = mx - (mx - rt.ox) * k;
     rt.oy = my - (my - rt.oy) * k;
     rt.z *= k;
+    clampRtCamera();
     wake();
   };
 
@@ -2677,50 +2969,29 @@ export default function App() {
       const wp = pos(wn, rt.by);
       if (Math.hypot(wp[0] - q[0], wp[1] - q[1]) <= wingHitR) return wn;
     }
-    const pieceHit = hitTestPiece(q, rt.pieces, rt.wingPop, rt.superWings);
+    const pieceHit = hitTestPiece(q, rt.pieces, rt.wingPop);
     if (pieceHit?.piece.name === 'Backshoulder') {
       return rt.by[pieceHit.node.id === 'braceL' ? 'wingL' : 'wingR'] ?? pieceHit.node;
     }
     return null;
   };
 
-  const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (e.detail !== 3) return;
-    const rt = rtRef.current;
-    if (!rt) return;
-    solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
-    const q = toWorld(e);
-    const wn = isNearWing(q, rt);
-    if (wn) {
-      rt.superWings = !rt.superWings;
-      rt.prometheusWings = true;
-      rt.wingTarget = 1;
-      rt.sel = wn;
-      sortPiecesForWings(rt.pieces, true);
-      window.clearTimeout(copyToastTimerRef.current);
-      setCopyToast(rt.superWings ? 'Super Prometheus Wings (5×)' : 'Prometheus Wings (1×)');
-      copyToastTimerRef.current = window.setTimeout(() => setCopyToast(null), 1800);
-      syncUi();
-      wake();
-    }
-  };
-
   const handleCanvasDoubleClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const rt = rtRef.current;
     if (!rt) return;
-    solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
+    solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, rt.ribAnchor);
     const q = toWorld(e);
 
-    // 1. Wing toggle (2x click pops/tucks 1x wings; 3x click in handleCanvasClick toggles 5x Super Prometheus Wings)
+    // 1. Wing toggle (2x click pops/tucks elastic Prometheus wings)
     const wn = isNearWing(q, rt);
     if (wn) {
       rt.prometheusWings = !rt.prometheusWings;
-      if (!rt.prometheusWings) rt.superWings = false;
       rt.wingTarget = rt.prometheusWings ? 1 : 0;
       rt.sel = wn;
       sortPiecesForWings(rt.pieces, rt.prometheusWings);
       if (rt.ribAnchor === 'lower') {
-        applyChungusChestCavity(rt.by, rt.prometheusWings);
+        solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, rt.ribAnchor);
+        applyChungusChestCavity(rt.by, rt.prometheusWings, rt.prometheusWings);
       }
       if (!rt.prometheusWings) {
         rt.nodes.forEach((n) => {
@@ -2732,7 +3003,7 @@ export default function App() {
         rt.prometheusWings
           ? rt.ribAnchor === 'lower'
             ? 'Prometheus wings + Chungus chest cavity active'
-            : 'Prometheus wings popped out'
+            : 'Prometheus wings popped out (elastic)'
           : 'Prometheus wings tucked',
       );
       copyToastTimerRef.current = window.setTimeout(() => setCopyToast(null), 1600);
@@ -2741,7 +3012,7 @@ export default function App() {
       return;
     }
 
-    // 2. Generous hand proximity check so double-clicking around wrist or palm reliably opens Gotz Hand Editor
+    // 2. Generous hand & foot proximity checks so double-clicking opens Gotz Hand or Piggy Foot
     const handProxR = (78 * rt.dpr) / rt.z;
     for (const s of ['R', 'L'] as const) {
       const hn = rt.by['hand' + s];
@@ -2760,8 +3031,27 @@ export default function App() {
       }
     }
 
-    // 3. Fallback sprite pixel hit-test
-    const hit = hitTest(q, rt.pieces, rt.wingPop, rt.superWings);
+    const footProxR = (76 * rt.dpr) / rt.z;
+    for (const s of ['R', 'L'] as const) {
+      const fn = rt.by['foot' + s];
+      if (!fn) continue;
+      const fp = pos(fn, rt.by);
+      const tn = rt.by['toe' + s];
+      const tip = tn ? pos(tn, rt.by) : [fp[0] + (s === 'R' ? -240 : 240), fp[1] + 220];
+      const mx = (fp[0] + tip[0]) * 0.5;
+      const my = (fp[1] + tip[1]) * 0.5;
+      if (Math.hypot(fp[0] - q[0], fp[1] - q[1]) <= footProxR || Math.hypot(mx - q[0], my - q[1]) <= footProxR * 1.45) {
+        rt.sel = fn;
+        openPartForNode(fn);
+        syncUi();
+        wake();
+        return;
+      }
+    }
+
+    // 3. Fallback sprite pixel hit-test (skip double-cycling if click was on head swivel, since pointerUp cycles per click)
+    if (rt.sel.id === 'lip' || rt.sel.id === 'chinTip') return;
+    const hit = hitTest(q, rt.pieces, rt.wingPop);
     if (hit) openPartForNode(hit);
   };
 
@@ -2806,6 +3096,10 @@ export default function App() {
     partMgrRef.current &&
     (rt.sel.id === 'handR' ||
       rt.sel.id === 'handL' ||
+      rt.sel.id === 'footR' ||
+      rt.sel.id === 'footL' ||
+      rt.sel.id === 'toeR' ||
+      rt.sel.id === 'toeL' ||
       rt.sel.parent === 'handR' ||
       rt.sel.parent === 'handL' ||
       rt.sel.id.startsWith('thumb') ||
@@ -2824,7 +3118,7 @@ export default function App() {
     if (!activePart || activePart.key !== 'hand' || !rt) return undefined;
     const hn = rt.by[activePart.id];
     if (!hn) return undefined;
-    solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
+    solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, rt.ribAnchor);
     const w = hn.w;
     return Math.round(normalizeDeg(Math.atan2(w[1], w[0]) / DEG + 180) * 10) / 10;
   })();
@@ -2864,24 +3158,29 @@ export default function App() {
                 if (!rt) return;
                 const prevMode = rt.ribAnchor;
                 if (prevMode === 'lower' && nextMode !== 'lower') {
-                  applyChungusChestCavity(rt.by, false);
+                  applyChungusChestCavity(rt.by, false, rt.prometheusWings);
                 }
                 rt.ribAnchor = nextMode;
-                applyRibAnchorMode(rt.by, nextMode);
+                applyRibAnchorMode(rt.by, nextMode, rt.prometheusWings);
                 if (nextMode === 'lower') {
                   rt.prometheusWings = true;
                   rt.wingTarget = 1;
                   sortPiecesForWings(rt.pieces, true);
-                  applyChungusChestCavity(rt.by, true);
+                  solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, 'lower');
+                  applyChungusChestCavity(rt.by, true, true);
                   window.clearTimeout(copyToastTimerRef.current);
-                  setCopyToast('Chungus Swing · Chest cavity + Prometheus wings');
+                  setCopyToast('Chungus Swing · Spine junction + elastic Prometheus wings');
                   copyToastTimerRef.current = window.setTimeout(() => setCopyToast(null), 1700);
                 }
                 syncUi();
                 wake();
               }}
               skullView={rt?.skullView ?? 'front'}
-              onSkullViewChange={(view) => cycleSkullView(view)}
+              headTurnStep={rt?.headStep ?? 0}
+              onHeadTurnStep={setHeadTurnStepExplicit}
+              onSkullViewChange={(view) =>
+                setHeadTurnStepExplicit(view === 'front' ? 0 : view === 'back' ? 2 : 1)
+              }
               gotzPoseCode={selectedHandInst?.gotz ? getGotzPoseCode(selectedHandInst.gotz) : undefined}
               onQuickGotzPreset={
                 selectedHandInst?.gotz
@@ -2897,21 +3196,46 @@ export default function App() {
                   : undefined
               }
               onOpenPartEditor={openPartForNode}
+              onApplyPreset={(presetId) => {
+                const builtins = createBuiltinChungusLibraryPoses();
+                const entry = builtins.find((b) =>
+                  presetId === 'promethean' ? b.id === 'builtin_promethean_chungus' : b.id === 'builtin_chungus',
+                );
+                if (entry) handleApplyLibraryPose(entry);
+              }}
+              onMirrorSide={(mode) => {
+                if (!rt) return;
+                mirrorPoseSide(rt.nodes, mode);
+                if (!rt.prometheusWings) {
+                  rt.nodes.forEach((n) => {
+                    n.ang = clampRealisticShoulder(n, n.ang, rt.by, false);
+                  });
+                }
+                ikPinsRef.current = syncPinsFromRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, ikPinsRef.current);
+                syncUi();
+                wake();
+                window.clearTimeout(copyToastTimerRef.current);
+                setCopyToast(mode === 'RtoLArms' ? 'Mirrored Right → Left arms' : 'Mirrored Left → Right side');
+                copyToastTimerRef.current = window.setTimeout(() => setCopyToast(null), 1500);
+              }}
               onAngleChange={(deg) => {
                 if (!rt || !tgt) return;
+                solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, rt.ribAnchor);
                 tgt.ang = clampAnatomicalAngle(
                   tgt,
                   clampChungusRibAngle(
                     tgt.id,
                     clampRealisticShoulder(tgt, deg, rt.by, rt.prometheusWings),
                     rt.ribAnchor,
+                    rt.by,
+                    rt.prometheusWings,
                   ),
                   rt.constrainLimits,
                 );
                 if (rt.ribAnchor === 'lower' && (tgt.id === 'ribR' || tgt.id === 'ribL')) {
                   const oppRib = rt.by[tgt.id === 'ribR' ? 'ribL' : 'ribR'];
                   if (oppRib) {
-                    oppRib.ang = clampChungusRibAngle(oppRib.id, -tgt.ang, 'lower');
+                    oppRib.ang = clampChungusRibAngle(oppRib.id, -tgt.ang, 'lower', rt.by, rt.prometheusWings);
                   }
                 }
                 syncUi();
@@ -2921,6 +3245,8 @@ export default function App() {
                 if (!rt) return;
                 rt.root.tx = tx;
                 rt.root.ty = ty;
+                syncPerspectiveSpine();
+                clampRtCamera();
                 syncUi();
                 wake();
               }}
@@ -2944,11 +3270,11 @@ export default function App() {
               onTogglePrometheusWings={(v) => {
                 if (!rt) return;
                 rt.prometheusWings = v;
-                if (!v) rt.superWings = false;
                 rt.wingTarget = v ? 1 : 0;
                 sortPiecesForWings(rt.pieces, v);
                 if (rt.ribAnchor === 'lower') {
-                  applyChungusChestCavity(rt.by, v);
+                  solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, 'lower');
+                  applyChungusChestCavity(rt.by, v, v);
                 }
                 if (!v) {
                   rt.nodes.forEach((n) => {
@@ -2970,6 +3296,8 @@ export default function App() {
                   rt.root.tx = 0;
                   rt.root.ty = 0;
                 }
+                syncPerspectiveSpine();
+                clampRtCamera();
                 syncUi();
                 wake();
               }}
@@ -2977,12 +3305,13 @@ export default function App() {
                 if (!rt || !partMgrRef.current) return;
                 snapSpringRef.current = null;
                 sidePoseRef.current = null;
-                rt.superWings = false;
                 rt.prometheusWings = false;
+                rt.wingVel = 0;
                 rt.wingTarget = 0;
                 rt.ribAnchor = 'upper';
                 rt.skullView = 'front';
-                if (rt.by.head) applySkullView(rt.by.head, 'front', wake);
+                rt.headStep = 0;
+                if (rt.by.head) applyHeadTurnStep(rt.by.head, 0, wake);
                 for (const partId in partMgrRef.current.inst) {
                   partMgrRef.current.inst[partId].reset();
                 }
@@ -2991,12 +3320,15 @@ export default function App() {
                   n.flipX = false;
                   n.piv = n.rest.slice() as [number, number];
                 });
-                applyRibAnchorMode(rt.by, 'upper');
+                applyRibAnchorMode(rt.by, 'upper', false);
                 rt.root.tx = 0;
                 rt.root.ty = 0;
                 perspRef.current = { ...PERSP_DEFAULT, enabled: perspRef.current.enabled };
+                perspSpineBiasRef.current = { lumbar: 0, thorax: 0 };
+                syncPerspectiveSpine();
                 ikConfigRef.current = { ...ikConfigRef.current, groundY: PERSP_DEFAULT.groundY };
                 ikPinsRef.current = syncPinsFromRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, {});
+                clampRtCamera();
                 syncUi();
                 wake();
               }}
@@ -3048,6 +3380,7 @@ export default function App() {
               onTogglePersp={(enabled) => {
                 perspRef.current = { ...perspRef.current, enabled };
                 if (!enabled) hoverPerspRef.current = null;
+                syncPerspectiveSpine();
                 syncUi();
                 wake();
               }}
@@ -3058,13 +3391,14 @@ export default function App() {
                   enforceGroundContact(rt.nodes, rt.by, rt.root, rt.bondOn, rt.wingPop, ikConfigRef.current.groundY, false);
                   syncAllPinsToRig();
                 }
+                syncPerspectiveSpine();
                 syncUi();
                 wake();
               }}
               onUpdateConfig={handleUpdateIkConfig}
               onTogglePin={(effectorId) => {
                 if (!rt) return;
-                solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
+                solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, rt.ribAnchor);
                 const n = rt.by[effectorId];
                 if (!n) return;
                 const tip = tipNodeForEffector(effectorId, rt.by);
@@ -3107,7 +3441,7 @@ export default function App() {
                 if (ikConfigRef.current.mode !== 'fk') {
                   const E = rt.by[chain.effector];
                   if (E) {
-                    solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
+                    solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, rt.ribAnchor);
                     const ePos = pos(E, rt.by);
                     const tip = tipNodeForEffector(E.id, rt.by);
                     const dir0 = getWorldDir(E, tip ? tip.piv : null, rt.by);
@@ -3296,7 +3630,7 @@ export default function App() {
                     n.ang = old[k] + Math.sin(i / 20 + k) * 12;
                   });
                   const s = performance.now();
-                  solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop);
+                  solveRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, rt.ribAnchor);
                   rendererRef.current.render({
                     cv,
                     ctx,
@@ -3369,11 +3703,27 @@ export default function App() {
   const panelOrder: PanelId[] = ['pose', 'bones', 'ik', 'tl', 'library', 'data', 'roadmap', 'about'];
   const dockedPanelIds = panelOrder.filter((id) => panels[id].open && !panels[id].floating);
   const floatingPanelIds = panelOrder.filter((id) => panels[id].open && panels[id].floating);
+  const horizonScreenY =
+    rt && perspRef.current.enabled
+      ? (perspRef.current.horizonY * rt.z + rt.oy) / rt.dpr
+      : null;
+  const groundScreenY =
+    rt && perspRef.current.enabled
+      ? (perspRef.current.groundY * rt.z + rt.oy) / rt.dpr
+      : null;
 
   return (
-    <div className="flex h-[100dvh] w-screen flex-col overflow-hidden bg-[#121315] text-[#e6e8ec] select-none">
+    <div
+      className="flex h-[100dvh] w-screen flex-col overflow-hidden bg-[#121315] text-[#e6e8ec] select-none"
+      onPointerDownCapture={() => {
+        if (!backdropDismissedRef.current) {
+          backdropDismissedRef.current = true;
+          wake();
+        }
+      }}
+    >
       {/* Single-Row Top Toolbar (never wraps over the model) */}
-      <TopToolbar
+      <RigSystemsPanel
         panels={panels}
         mode={rt?.mode ?? 'A'}
         ikMode={ikConfigRef.current.mode}
@@ -3404,6 +3754,7 @@ export default function App() {
         onTogglePersp={(v) => {
           perspRef.current = { ...perspRef.current, enabled: v };
           if (!v) hoverPerspRef.current = null;
+          syncPerspectiveSpine();
           syncUi();
           wake();
         }}
@@ -3414,75 +3765,140 @@ export default function App() {
         }}
       />
 
-      {/* Main Workspace: Stage Flex-Container maintains aspect containment; UI panels never squeeze canvas */}
-      <main className="relative flex min-h-0 min-w-0 flex-1 items-center justify-center overflow-hidden bg-[#121315]">
-        {/* Stage Flex-Container */}
-        <div
-          ref={stageRef}
-          className="relative flex h-full w-full min-h-0 min-w-0 flex-1 items-center justify-center overflow-hidden bg-[#121315]"
-        >
-          <canvas
-            ref={canvasRef}
-            onPointerDown={handleCanvasPointerDown}
-            onPointerMove={handleCanvasPointerMove}
-            onPointerUp={handleCanvasPointerUp}
-            onPointerCancel={handleCanvasPointerUp}
-            onPointerLeave={() => {
-              const changed = !!(rtRef.current?.hov || hoverPerspRef.current);
-              if (rtRef.current) rtRef.current.hov = null;
-              hoverPerspRef.current = null;
-              if (canvasRef.current) canvasRef.current.style.cursor = 'crosshair';
-              if (changed) repaint();
-            }}
-            onWheel={handleCanvasWheel}
-            onClick={handleCanvasClick}
-            onDoubleClick={handleCanvasDoubleClick}
-            onContextMenu={handleContextMenu}
-            className="block h-full w-full max-h-full max-w-full touch-none cursor-crosshair"
-          />
+      {/* Main Workspace: Stage Flex-Container + Modular On-Canvas Split Part Pop-Up with Top/Bottom Room Sliders */}
+      <main className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-[#121315]">
+        {activePart && (
+          <div className="flex h-7 shrink-0 items-center justify-center gap-3 border-b border-[#2b2f36] bg-[#16181c] px-3 text-[11px] text-[#c7cbd3]">
+            <span className="font-medium text-[#34d399]">Model Room</span>
+            <input
+              type="range"
+              min={28}
+              max={72}
+              value={modelSplitPct}
+              onChange={(e) => setModelSplitPct(+e.target.value)}
+              aria-label="Top room slider between Model and Hand/Foot"
+              className="studio-range w-48 max-w-[44vw]"
+            />
+            <span className="font-medium text-[#c084fc]">
+              {activePart.key === 'foot' ? 'Foot Room' : 'Hand Room'}
+            </span>
+          </div>
+        )}
 
-          {/* On-demand HUD stats (stage top-left, never overlaps bars) */}
-          {showStats && (
-            <div className="font-mono-tabular pointer-events-none absolute top-2 left-2 z-10 rounded bg-[#121315]/75 px-1.5 py-0.5 whitespace-pre text-[10.5px] text-[#c7cbd3]/85">
-              {hudText}
+        <div className="relative flex min-h-0 min-w-0 flex-1 flex-col sm:flex-row">
+          {/* Stage Flex-Container */}
+          <div
+            ref={stageRef}
+            style={activePart ? { flexBasis: `${modelSplitPct}%`, flexGrow: 0, flexShrink: 0 } : undefined}
+            className={`relative flex min-h-0 min-w-0 items-center justify-center overflow-hidden bg-[#121315] ${
+              activePart ? 'min-h-[34%] sm:h-full' : 'h-full w-full flex-1'
+            }`}
+          >
+            <canvas
+              ref={canvasRef}
+              onPointerDown={handleCanvasPointerDown}
+              onPointerMove={handleCanvasPointerMove}
+              onPointerUp={handleCanvasPointerUp}
+              onPointerCancel={handleCanvasPointerUp}
+              onPointerLeave={() => {
+                const changed = !!(rtRef.current?.hov || hoverPerspRef.current);
+                if (rtRef.current) rtRef.current.hov = null;
+                hoverPerspRef.current = null;
+                if (canvasRef.current) canvasRef.current.style.cursor = 'crosshair';
+                if (changed) repaint();
+              }}
+              onWheel={handleCanvasWheel}
+              onDoubleClick={handleCanvasDoubleClick}
+              onContextMenu={handleContextMenu}
+              className="block h-full w-full max-h-full max-w-full touch-none cursor-crosshair"
+            />
+
+            <StageHud
+              showPersp={perspRef.current.enabled}
+              horizonScreenY={horizonScreenY}
+              groundScreenY={groundScreenY}
+              hoverPersp={hoverPerspRef.current}
+              draggingPersp={dragRef.current?.t === 'persp' ? dragRef.current.what : null}
+              showStats={showStats}
+              hudText={hudText}
+              copyToast={copyToast}
+              safeHudInset={safeHudInset}
+              ikMode={ikConfigRef.current.mode}
+              elasticPinFull={ikConfigRef.current.elasticPinFull}
+              onToggleElasticPinFull={() =>
+                handleUpdateIkConfig({ elasticPinFull: !ikConfigRef.current.elasticPinFull })
+              }
+            />
+          </div>
+
+          {/* Modular On-Canvas Gotz Hand / Piggy Foot Pop-Up (live syncs onto main model pushed cleanly beside it) */}
+          {activePart && (
+            <div className="relative flex min-h-0 min-w-0 flex-1 items-center justify-center border-t border-[#2b2f36] bg-[#14161a] p-2 sm:border-t-0 sm:border-l">
+              <div style={{ height: `${partHeightPct}%` }} className="w-full min-h-[210px] overflow-hidden">
+                <PartRigModal
+                  part={activePart}
+                  screenAngleDeg={activeHandScreenAngleDeg}
+                  forearmAngleDeg={
+                    activePart.key === 'hand' && rt
+                      ? rt.by[activePart.id === 'handR' ? 'forearmR' : 'forearmL']?.ang
+                      : undefined
+                  }
+                  onForearmAngleChange={
+                    activePart.key === 'hand'
+                      ? (deg) => {
+                          const curRt = rtRef.current;
+                          if (!curRt) return;
+                          const fn = curRt.by[activePart.id === 'handR' ? 'forearmR' : 'forearmL'];
+                          if (!fn) return;
+                          fn.ang = clampAnatomicalAngle(fn, deg, curRt.constrainLimits);
+                          solveRig(curRt.nodes, curRt.by, curRt.bondOn, curRt.wingPop, curRt.ribAnchor);
+                          syncUi();
+                          wake();
+                        }
+                      : undefined
+                  }
+                  onClose={() => setActivePart(null)}
+                  onMutated={(part) => {
+                    const curRt = rtRef.current;
+                    const mgr = partMgrRef.current;
+                    if (!curRt || !mgr) return;
+                    part.touched = 1;
+                    mgr.linkOut(part, curRt.by);
+                    mgr.rebake(part, wake);
+                    syncUi();
+                  }}
+                />
+              </div>
             </div>
           )}
 
-          {/* Unobstructed Safe-Zone Overlay for Toast & Onboarding Hint */}
-          <div
-            className="pointer-events-none absolute top-0 left-0 z-10"
-            style={{ right: safeHudInset.right, bottom: safeHudInset.bottom }}
-          >
-            {copyToast && (
-              <div
-                className={`pointer-events-none absolute bottom-2 left-1/2 z-20 -translate-x-1/2 rounded border px-3 py-1 text-[12px] font-medium shadow-lg ${
-                  copyToast === 'Invalid JSON'
-                    ? 'border-[#ff3b6b] bg-[#191b1f] text-[#ff6b8f]'
-                    : 'border-[#10b981] bg-[#191b1f] text-[#34d399]'
-                }`}
-              >
-                {copyToast}
-              </div>
-            )}
-
-            <div
-              className={`pointer-events-none absolute bottom-2 left-1/2 z-10 max-w-[92%] -translate-x-1/2 rounded-lg border border-[#2b2f36] bg-[#191b1f]/95 px-3 py-1 text-center text-[11px] text-[#c7cbd3] transition-opacity duration-1000 sm:text-[12px] ${
-                hintVisible ? 'opacity-90' : 'opacity-0'
-              }`}
+          {/* Non-Squeezing Docked Panels Overlay (side rail >=520px, bottom drawer <520px) */}
+          {dockedPanelIds.length > 0 && (
+            <aside
+              ref={asideRef}
+              className="pointer-events-none absolute right-2 bottom-2 left-2 z-20 flex max-h-[36dvh] flex-col gap-2 overflow-y-auto min-[520px]:top-2 min-[520px]:bottom-auto min-[520px]:left-auto min-[520px]:max-h-[calc(100%-16px)] min-[520px]:w-[min(252px,44vw)] md:w-[min(280px,38vw)] lg:w-[304px]"
             >
-              Drag hands, feet, knees, or spine for FABRIK IK (Alt = pure FK) · double-click head, hand or foot · double right-click copies JSON
-            </div>
-          </div>
+              {dockedPanelIds.map((id) => renderPanelById(id))}
+            </aside>
+          )}
         </div>
 
-        {/* Non-Squeezing Docked Panels Overlay (side rail >=520px, bottom drawer <520px) */}
-        {dockedPanelIds.length > 0 && (
-          <aside
-            ref={asideRef}
-            className="pointer-events-none absolute right-2 bottom-2 left-2 z-20 flex max-h-[36dvh] flex-col gap-2 overflow-y-auto min-[520px]:top-2 min-[520px]:bottom-auto min-[520px]:left-auto min-[520px]:max-h-[calc(100%-16px)] min-[520px]:w-[min(252px,44vw)] md:w-[min(280px,38vw)] lg:w-[304px]"
-          >
-            {dockedPanelIds.map((id) => renderPanelById(id))}
-          </aside>
+        {activePart && (
+          <div className="flex h-7 shrink-0 items-center justify-center gap-3 border-t border-[#2b2f36] bg-[#16181c] px-3 text-[11px] text-[#c7cbd3]">
+            <span className="font-medium text-[#34d399]">Compact Popup</span>
+            <input
+              type="range"
+              min={56}
+              max={100}
+              value={partHeightPct}
+              onChange={(e) => setPartHeightPct(+e.target.value)}
+              aria-label="Bottom room slider for Hand/Foot popup height"
+              className="studio-range w-48 max-w-[44vw]"
+            />
+            <span className="font-medium text-[#c084fc]">
+              Full {activePart.key === 'foot' ? 'Foot' : 'Hand'}
+            </span>
+          </div>
         )}
       </main>
 
@@ -3493,91 +3909,31 @@ export default function App() {
         </div>
       )}
 
-      {/* Single Compact In-Flow Bottom Menu (Live Coordinates JSON + Copy/Apply + JSON/PNG Export + Stats) */}
-      <footer
-        className="relative z-20 flex w-full shrink-0 items-center gap-1 border-t border-[#2b2f36] bg-[#191b1f]/95 px-2 py-1.5 backdrop-blur-sm"
-        style={{ paddingBottom: 'calc(6px + env(safe-area-inset-bottom, 0px))' }}
-      >
-        <input
-          type="text"
-          value={jsonText}
-          onChange={(e) => {
-            benchmarkMsgRef.current = false;
-            setJsonText(e.target.value);
-          }}
-          onFocus={(e) => {
-            jsonEditingRef.current = true;
-            e.currentTarget.select();
-          }}
-          onBlur={() => {
-            jsonEditingRef.current = false;
-            if (!benchmarkMsgRef.current) {
-              const live = buildJsonString();
-              if (live) setJsonText(live);
-            }
-          }}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') {
-              e.preventDefault();
-              applyJsonInput(jsonText);
-              e.currentTarget.blur();
-            }
-          }}
-          spellCheck={false}
-          aria-label="Live coordinates and pose JSON"
-          title="Live pose and joint coordinates JSON · Paste and press Enter to apply · Double right-click canvas to copy"
-          className="font-mono-tabular min-w-[48px] flex-1 rounded border border-[#2b2f36] bg-[#0e0f11] px-2 py-1 text-[11px] text-[#d6dae2] focus:border-[#a855f7] focus:outline-none"
-        />
-        <button
-          type="button"
-          onClick={() => void copyRawJson()}
-          title="Copy raw JSON (or double right-click canvas)"
-          className="whitespace-nowrap shrink-0 rounded border border-[#2b2f36] bg-[#121315] px-1.5 py-1 text-[11px] font-medium text-[#e6e8ec] transition-colors hover:border-[#10b981] hover:text-[#34d399]"
-        >
-          Copy
-        </button>
-        <button
-          type="button"
-          onClick={() => applyJsonInput(jsonText)}
-          title="Apply JSON pose"
-          className="whitespace-nowrap shrink-0 rounded border border-[#10b981]/50 bg-[#10b981]/15 px-1.5 py-1 text-[11px] font-medium text-[#34d399] transition-colors hover:bg-[#10b981]/25"
-        >
-          Apply
-        </button>
-        <span className="mx-0.5 h-4 w-px shrink-0 bg-[#2b2f36]" aria-hidden="true" />
-        <button
-          type="button"
-          onClick={handleExportJson}
-          title="Download pose, keys and part rigs as .json"
-          className="whitespace-nowrap shrink-0 rounded border border-[#2b2f36] bg-[#121315] px-1.5 py-1 text-[11px] font-medium text-[#e6e8ec] transition-colors hover:border-[#a855f7] hover:text-[#d8b4fe]"
-        >
-          JSON
-        </button>
-        <button
-          type="button"
-          onClick={handleExportPng}
-          title="Export pose as PNG (also: triple right-click)"
-          className="whitespace-nowrap shrink-0 rounded border border-[#2b2f36] bg-[#121315] px-1.5 py-1 text-[11px] font-medium text-[#e6e8ec] transition-colors hover:border-[#10b981] hover:text-[#34d399]"
-        >
-          PNG
-        </button>
-        <button
-          type="button"
-          onClick={() => {
-            setHintVisible(false);
-            setShowStats((s) => !s);
-            wake();
-          }}
-          title="Toggle frame & CPU stats"
-          className={`whitespace-nowrap shrink-0 rounded border px-1.5 py-1 text-[11px] font-medium transition-colors ${
-            showStats
-              ? 'border-[#a855f7] bg-[#7e22ce] text-white'
-              : 'border-[#2b2f36] bg-[#121315] text-[#c7cbd3] hover:border-[#a855f7]/70 hover:text-white'
-          }`}
-        >
-          Stats
-        </button>
-      </footer>
+      {/* Single Compact In-Flow Bottom Menu (Canonical 43-joint RigStatePayload + Copy/Apply + JSON/PNG Export + Stats) */}
+      <TimelineDock
+        jsonText={jsonText}
+        showStats={showStats}
+        canonicalKeyCount={rt?.canonicalKeys.length ?? 0}
+        onJsonChange={(val) => {
+          benchmarkMsgRef.current = false;
+          setJsonText(val);
+        }}
+        onJsonFocusChange={(focused) => {
+          jsonEditingRef.current = focused;
+          if (!focused && !benchmarkMsgRef.current) {
+            const live = buildJsonString();
+            if (live) setJsonText(live);
+          }
+        }}
+        onCopyJson={() => void copyRawJson()}
+        onApplyJson={applyJsonInput}
+        onExportJson={handleExportJson}
+        onExportPng={handleExportPng}
+        onToggleStats={() => {
+          setShowStats((s) => !s);
+          wake();
+        }}
+      />
 
       {/* Loading / Error State */}
       {loading && (
@@ -3594,22 +3950,6 @@ export default function App() {
           </div>
         </div>
       )}
-
-      {/* Hierarchical Gotz Hand Rig Modal (Yorrick & Piggy deactivated; skull cycles Front/Side/Back) */}
-      <PartRigModal
-        part={activePart}
-        screenAngleDeg={activeHandScreenAngleDeg}
-        onClose={() => setActivePart(null)}
-        onMutated={(part) => {
-          const rt = rtRef.current;
-          const mgr = partMgrRef.current;
-          if (!rt || !mgr) return;
-          part.touched = 1;
-          mgr.linkOut(part, rt.by);
-          mgr.rebake(part, wake);
-          syncUi();
-        }}
-      />
     </div>
   );
 }

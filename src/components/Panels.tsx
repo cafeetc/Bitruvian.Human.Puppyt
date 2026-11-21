@@ -1,9 +1,15 @@
+/**
+ * Feature Notes (Plain English):
+ * - Floating / Docked Inspector Panels: Pose sliders (with Gotz Hand, Piggy Foot, and 4-step
+ *   head turntable buttons), 43-Bone hierarchy slider, ABC Keyframes & Motion Curves,
+ *   Pose Library, Data JSON/BSK import-export, IK & Elastic Pin settings, and About guide.
+ */
 import React, { useMemo, useRef, useState } from 'react';
 import { getTensionRatio, toPure360, type RibAnchorMode } from '../engine/fkEngine';
 import { EFFECTOR_IDS, IK_MODE_LABELS } from '../engine/ikEngine';
 import { ABC_SLOTS, FPS_PRESETS, getFilledAbcSlots, sampleMotionCurvePath } from '../engine/motionEngine';
 import { GITHUB_ROADMAP, LIMB_CHAINS } from '../engine/rigMetadata';
-import type { SkullViewMode } from '../engine/skullKitModels';
+import { HEAD_TURN_SEQUENCE, type HeadTurnStep, type SkullViewMode } from '../engine/skullKitModels';
 import type {
   AbcLoopMode,
   AbcSerializedState,
@@ -47,6 +53,10 @@ interface PosePanelProps {
   onRibAnchorModeChange?: (mode: RibAnchorMode) => void;
   skullView?: SkullViewMode;
   onSkullViewChange?: (view: SkullViewMode) => void;
+  headTurnStep?: HeadTurnStep;
+  onHeadTurnStep?: (step: HeadTurnStep) => void;
+  onApplyPreset?: (id: 'chungus' | 'promethean') => void;
+  onMirrorSide?: (mode: 'RtoLArms' | 'LtoRSide') => void;
 }
 
 export const PosePanel: React.FC<PosePanelProps> = ({
@@ -75,6 +85,10 @@ export const PosePanel: React.FC<PosePanelProps> = ({
   onRibAnchorModeChange,
   skullView = 'front',
   onSkullViewChange,
+  headTurnStep = 0,
+  onHeadTurnStep,
+  onApplyPreset,
+  onMirrorSide,
 }) => {
   const curAngle = target ? Math.round(target.ang) : 0;
   const tension = target ? getTensionRatio(target) : { ratio: 0, nearLimit: false, atLimit: false };
@@ -86,6 +100,13 @@ export const PosePanel: React.FC<PosePanelProps> = ({
       selected.parent === 'handL' ||
       selected.parent?.startsWith('thumb') ||
       selected.parent?.startsWith('finger'))
+  );
+  const isFootSel = !!(
+    selected &&
+    (selected.id === 'footR' ||
+      selected.id === 'footL' ||
+      selected.id === 'toeR' ||
+      selected.id === 'toeL')
   );
   const isHeadSel = !!(selected && (selected.id === 'head' || selected.id === 'lip' || selected.id === 'chinTip'));
 
@@ -101,7 +122,7 @@ export const PosePanel: React.FC<PosePanelProps> = ({
             onClick={() => onOpenPartEditor(selected)}
             className="whitespace-nowrap shrink-0 rounded border border-[#a855f7]/60 bg-[#a855f7]/15 px-2 py-0.5 text-[11px] font-medium text-[#d8b4fe] transition-colors hover:bg-[#a855f7]/30"
           >
-            {isHandSel ? 'Open Gotz Hand' : 'Open sub-rig'}
+            {isHandSel ? 'Open Gotz Hand' : isFootSel ? 'Open Piggy Foot' : 'Open sub-rig'}
           </button>
         )}
       </div>
@@ -193,7 +214,7 @@ export const PosePanel: React.FC<PosePanelProps> = ({
         {onTogglePrometheusWings && (
           <label
             className="flex cursor-pointer items-center gap-1.5"
-            title="Or double-click a Prometheus wing circle on the shoulder blade to pop wings out; default drag adjusts shrug & shoulders"
+            title="Double-click a Prometheus wing circle on the shoulder blade to pop/tuck elastic wings; dragging wings drives strong arm compensation"
           >
             <input
               type="checkbox"
@@ -215,8 +236,8 @@ export const PosePanel: React.FC<PosePanelProps> = ({
         {prometheusWings && (
           <div className="text-[#c084fc]">
             {ribAnchorMode === 'lower'
-              ? 'chungus swing · chest cavity + prometheus wings'
-              : 'prometheus wings · popped out (rigid)'}
+              ? 'chungus swing · spine junction + elastic wings'
+              : 'elastic wings · arm compensation active'}
           </div>
         )}
         {(tension.nearLimit || tension.atLimit) && (
@@ -235,14 +256,15 @@ export const PosePanel: React.FC<PosePanelProps> = ({
           <div className="grid grid-cols-3 gap-1">
             {(
               [
-                ['upper', 'Upper Spine'],
-                ['lower', 'Chungus Swing'],
-                ['ribwings', 'Ribwings'],
+                ['upper', 'Upper Chest', 'Upper chest sternum [1258, 1130]'],
+                ['lower', 'Chungus Swing', 'Spine junction [1257.5, 2099.5] · constrained by swivel & collarbone'],
+                ['ribwings', 'Ribwings', 'Neck anchors [1215, 1049] / [1299, 993]'],
               ] as const
-            ).map(([m, label]) => (
+            ).map(([m, label, hint]) => (
               <button
                 key={m}
                 type="button"
+                title={hint}
                 onClick={() => onRibAnchorModeChange(m)}
                 className={`rounded border px-1.5 py-1 text-[10.5px] font-medium transition-colors ${
                   ribAnchorMode === m
@@ -257,27 +279,33 @@ export const PosePanel: React.FC<PosePanelProps> = ({
         </div>
       )}
 
-      {onSkullViewChange && (isHeadSel || skullView !== 'front') && (
+      {(onHeadTurnStep || onSkullViewChange) && (isHeadSel || skullView !== 'front' || headTurnStep !== 0) && (
         <div className="space-y-1 border-t border-[#2b2f36] pt-2">
           <div className="flex items-center justify-between text-[10.5px]">
-            <span className="font-semibold text-[#8b919c] uppercase">Skull Model</span>
-            <span className="text-[#8b919c]">2× click head</span>
+            <span className="font-semibold text-[#8b919c] uppercase">Skull 360°</span>
+            <span className="text-[#8b919c]">drag swivel or 2× click</span>
           </div>
-          <div className="grid grid-cols-3 gap-1">
-            {(['front', 'side', 'back'] as const).map((v) => (
-              <button
-                key={v}
-                type="button"
-                onClick={() => onSkullViewChange(v)}
-                className={`rounded border px-1.5 py-1 text-[10.5px] font-medium capitalize transition-colors ${
-                  skullView === v
-                    ? 'border-[#10b981] bg-[#10b981]/20 text-[#34d399]'
-                    : 'border-[#2b2f36] bg-[#121315] text-[#c7cbd3] hover:border-[#10b981]/60 hover:text-white'
-                }`}
-              >
-                {v}
-              </button>
-            ))}
+          <div className="grid grid-cols-4 gap-1">
+            {HEAD_TURN_SEQUENCE.map((spec) => {
+              const active = onHeadTurnStep ? headTurnStep === spec.step : skullView === spec.view;
+              return (
+                <button
+                  key={spec.step}
+                  type="button"
+                  onClick={() => {
+                    if (onHeadTurnStep) onHeadTurnStep(spec.step);
+                    else onSkullViewChange?.(spec.view);
+                  }}
+                  className={`rounded border px-1 py-1 text-[10.5px] font-medium transition-colors ${
+                    active
+                      ? 'border-[#10b981] bg-[#10b981]/20 text-[#34d399]'
+                      : 'border-[#2b2f36] bg-[#121315] text-[#c7cbd3] hover:border-[#10b981]/60 hover:text-white'
+                  }`}
+                >
+                  {spec.label}
+                </button>
+              );
+            })}
           </div>
         </div>
       )}
@@ -299,6 +327,57 @@ export const PosePanel: React.FC<PosePanelProps> = ({
                 {preset}
               </button>
             ))}
+          </div>
+        </div>
+      )}
+
+      {(onApplyPreset || onMirrorSide) && (
+        <div className="space-y-1 border-t border-[#2b2f36] pt-2">
+          <div className="flex items-center justify-between text-[10.5px]">
+            <span className="font-semibold text-[#8b919c] uppercase">Presets &amp; Mirror</span>
+            <span className="text-[#8b919c]">Mirrored rigs</span>
+          </div>
+          <div className="grid grid-cols-2 gap-1">
+            {onApplyPreset && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => onApplyPreset('chungus')}
+                  title="Apply Chungus pose (Left side mirrored to Right)"
+                  className="rounded border border-[#2b2f36] bg-[#121315] px-1.5 py-1 text-[10.5px] font-medium text-[#c7cbd3] transition-colors hover:border-[#a855f7] hover:text-white"
+                >
+                  Chungus Pose
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onApplyPreset('promethean')}
+                  title="Apply Promethean Chungus pose (Right arms mirrored to Left + elastic wings)"
+                  className="rounded border border-[#a855f7]/50 bg-[#a855f7]/15 px-1.5 py-1 text-[10.5px] font-medium text-[#e9d5ff] transition-colors hover:bg-[#a855f7]/30"
+                >
+                  Promethean Chungus
+                </button>
+              </>
+            )}
+            {onMirrorSide && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => onMirrorSide('RtoLArms')}
+                  title="Mirror live Right shoulder & arm angles onto the Left arm"
+                  className="rounded border border-[#2b2f36] bg-[#121315] px-1.5 py-1 text-[10.5px] text-[#a7abb4] transition-colors hover:border-[#10b981] hover:text-[#34d399]"
+                >
+                  Mirror R→L Arms
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onMirrorSide('LtoRSide')}
+                  title="Mirror live Left side (arm, leg, rib) onto the Right side"
+                  className="rounded border border-[#2b2f36] bg-[#121315] px-1.5 py-1 text-[10.5px] text-[#a7abb4] transition-colors hover:border-[#10b981] hover:text-[#34d399]"
+                >
+                  Mirror L→R Side
+                </button>
+              </>
+            )}
           </div>
         </div>
       )}
@@ -1907,6 +1986,22 @@ export const IKPanel: React.FC<IKPanelProps> = ({
             );
           })}
         </div>
+        <label
+          className={`flex cursor-pointer items-center gap-1.5 rounded border px-2 py-1 text-[11px] transition-colors ${
+            config.mode === 'pinFull'
+              ? 'border-[#10b981]/45 bg-[#10b981]/10 text-[#d1fae5]'
+              : 'border-[#2b2f36]/60 bg-[#121315]/50 text-[#8b919c]'
+          }`}
+          title="When Pin Full Rig is active, dragged wrists and feet pull elastically out from their pin anchors and snap back on release"
+        >
+          <input
+            type="checkbox"
+            checked={config.elasticPinFull}
+            onChange={(e) => onUpdateConfig({ elasticPinFull: e.target.checked })}
+            className="accent-[#10b981]"
+          />
+          <span>Strict elastic pin tether &amp; snap-back (Pin Full)</span>
+        </label>
       </div>
 
       {/* Pole / Bend Hint Flip */}

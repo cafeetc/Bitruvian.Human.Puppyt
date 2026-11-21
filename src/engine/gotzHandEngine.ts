@@ -1,3 +1,10 @@
+/**
+ * Feature Notes (Plain English):
+ * - Gotz 5-Digit Hand Engine: Builds an interactive hand with a connected forearm
+ *   above the wrist, a wrist carpal hub, and 5 articulated fingers solved by 14-pass IK.
+ * - Live Body Baking: Converts every finger/wrist adjustment into Bitruvius's matching
+ *   purple-and-black hand sprite and keeps finger/thumb IK tips synced on the body.
+ */
 import { mkCanvas } from './fkEngine';
 
 export type GotzDigitId = 'thumb' | 'index' | 'middle' | 'ring' | 'pinky';
@@ -30,6 +37,17 @@ export interface GotzHandState extends GotzHandPresetData {
   wholeIk: boolean;
   guides: boolean;
   style: GotzStyle;
+  /** Optional forearm angle above the wrist (degrees, synced with body forearm when open) */
+  forearm?: number;
+}
+
+export interface GotzForearmSolved {
+  pts: [[number, number], [number, number]];
+  elbowPt: [number, number];
+  wristPt: [number, number];
+  angRad: number;
+  angleDeg: number;
+  len: number;
 }
 
 export interface GotzSegment {
@@ -51,7 +69,7 @@ export interface GotzSolvedDigit {
 
 export interface GotzHierarchyBone {
   id: string;
-  digit: GotzDigitId | 'wrist';
+  digit: GotzDigitId | 'wrist' | 'forearm';
   boneIdx: number;
   label: string;
   depth: number;
@@ -286,6 +304,7 @@ export function createDefaultGotzHandState(mirror: boolean, presetName = 'Fist')
     wholeIk: true,
     guides: true,
     style: 'hand-app-1',
+    forearm: 0,
   };
 }
 
@@ -401,6 +420,25 @@ export function solveGotzHand(
   };
 }
 
+/**
+ * Solves the proximal forearm bone extending above the carpal wrist hub [0, 0] toward the elbow.
+ */
+export function solveGotzForearm(st: GotzHandState): GotzForearmSolved {
+  const angleDeg = clamp(st.forearm ?? 0, -65, 65);
+  const signedDeg = st.mirror ? -angleDeg : angleDeg;
+  const angRad = signedDeg * RAD;
+  const len = 3.85;
+  const elbowPt: [number, number] = [-Math.sin(angRad) * len, Math.cos(angRad) * len];
+  return {
+    pts: [elbowPt, [0, 0]],
+    elbowPt,
+    wristPt: [0, 0],
+    angRad,
+    angleDeg,
+    len,
+  };
+}
+
 function softElastic(val: number, lo: number, hi: number): number {
   if (val >= lo && val <= hi) return val;
   const over = val < lo ? val - lo : val - hi;
@@ -483,14 +521,24 @@ export function getGotzPoseCode(st: GotzHandState): string {
 
 export function buildGotzHierarchyTree(st: GotzHandState): GotzHierarchyBone[] {
   const active = GOTZ_BUILDS[st.build] || GOTZ_DIGITS;
+  const forearmDeg = Math.round((st.forearm ?? 0) * 10) / 10;
   const out: GotzHierarchyBone[] = [
+    {
+      id: 'forearm',
+      digit: 'forearm',
+      boneIdx: -2,
+      label: 'Forearm (Above Wrist)',
+      depth: 0,
+      parentId: null,
+      angleDeg: forearmDeg,
+    },
     {
       id: 'wrist',
       digit: 'wrist',
       boneIdx: -1,
       label: 'Wrist / Carpal Hub',
-      depth: 0,
-      parentId: null,
+      depth: 1,
+      parentId: 'forearm',
       angleDeg: Math.round(st.wrist * 10) / 10,
     },
   ];
@@ -503,7 +551,7 @@ export function buildGotzHierarchyTree(st: GotzHandState): GotzHierarchyBone[] {
       digit: d,
       boneIdx: 0,
       label: `${cap} Metacarpal`,
-      depth: 1,
+      depth: 2,
       parentId: 'wrist',
       angleDeg: Math.round(gotzSplayAngle(d, st) * 10) / 10,
     });
@@ -518,7 +566,7 @@ export function buildGotzHierarchyTree(st: GotzHandState): GotzHierarchyBone[] {
         digit: d,
         boneIdx: j + 1,
         label: `${cap} ${subNames[j]}`,
-        depth: 2 + j,
+        depth: 3 + j,
         parentId: prevId,
         angleDeg: Math.round((cur[j] ?? 0) * 10) / 10,
       });
@@ -534,6 +582,7 @@ export function lerpGotzHandState(a: GotzHandState, b: GotzHandState, t: number)
   const target = k >= 0.5 ? b : a;
   const out = cloneGotzState(target);
   out.wrist = lerp(a.wrist, b.wrist);
+  out.forearm = lerp(a.forearm ?? 0, b.forearm ?? 0);
   out.splay = lerp(a.splay, b.splay);
   out.tilt = lerp(a.tilt, b.tilt);
   out.thumb = lerp(a.thumb, b.thumb);
@@ -549,6 +598,20 @@ export function lerpGotzHandState(a: GotzHandState, b: GotzHandState, t: number)
     out.cj[d] = ca.map((v, i) => lerp(v, cb[i] ?? v));
   }
   return out;
+}
+
+export function gotzForearmSvgPath(len: number, widthMul: number, style: GotzStyle): string {
+  const halfWrist = 0.44 * widthMul;
+  const halfElbow = 0.72 * widthMul;
+  const ch = Math.min(len * 0.16, 0.36);
+  if (style === 'legacy') {
+    return `M ${-halfWrist * 0.7} 0 L ${halfWrist * 0.7} 0 L ${halfWrist} ${ch} L ${halfElbow} ${len - ch} L ${halfElbow * 0.65} ${len} L ${-halfElbow * 0.65} ${len} L ${-halfElbow} ${len - ch} L ${-halfWrist} ${ch} Z`;
+  }
+  if (style === 'hand-app-2') {
+    const belly = halfElbow * 0.96;
+    return `M 0 0 C ${halfWrist} 0 ${belly} ${len * 0.35} ${belly} ${len * 0.6} C ${halfElbow} ${len * 0.85} ${halfElbow * 0.8} ${len} 0 ${len} C ${-halfElbow * 0.8} ${len} ${-halfElbow} ${len * 0.85} ${-belly} ${len * 0.6} C ${-belly} ${len * 0.35} ${-halfWrist} 0 0 0 Z`;
+  }
+  return `M ${-halfWrist * 0.75} ${-ch * 0.1} Q 0 ${-ch * 0.32} ${halfWrist * 0.75} ${-ch * 0.1} C ${halfWrist * 1.05} ${ch} ${halfElbow * 1.04} ${len * 0.56} ${halfElbow * 0.9} ${len - ch} Q 0 ${len + ch * 0.35} ${-halfElbow * 0.9} ${len - ch} C ${-halfElbow * 1.04} ${len * 0.56} ${-halfWrist * 1.05} ${ch} ${-halfWrist * 0.75} ${-ch * 0.1} Z`;
 }
 
 export function gotzBoneSvgPath(seg: GotzSegment, boneIdx: number, totalBones: number, widthMul: number, style: GotzStyle): string {
