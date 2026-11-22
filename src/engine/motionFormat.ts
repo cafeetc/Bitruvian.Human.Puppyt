@@ -1,12 +1,30 @@
 import type { GotzHandState } from './gotzHandEngine';
 import type {
   AbcSerializedState,
+  BodyTurnView,
+  HeadTurnStep,
   Keyframe as LegacyKeyframe,
   PartRigInstance,
   PartSerializedState,
   PoseSnapshot,
   RigNode,
+  SkullViewMode,
 } from './types';
+
+const VALID_BODY_VIEWS = new Set<BodyTurnView>([
+  'front',
+  'threeQuarterR',
+  'threeQuarterL',
+  'sideR',
+  'sideL',
+  'back',
+]);
+
+export function parseBodyTurnView(raw: unknown): BodyTurnView | undefined {
+  return typeof raw === 'string' && VALID_BODY_VIEWS.has(raw as BodyTurnView)
+    ? (raw as BodyTurnView)
+    : undefined;
+}
 
 export const RIG_JOINTS = [
   'pelvis', 'lumbar', 'thorax', 'neck', 'head',
@@ -46,6 +64,9 @@ export interface RigStatePayload {
   parts: Record<string, PartPayloadState>;
   // Optional studio extensions preserved cleanly across round-trips
   flipX?: Record<string, boolean>;
+  headStep?: HeadTurnStep;
+  skullView?: SkullViewMode;
+  bodyView?: BodyTurnView;
   prometheusWings?: boolean;
   ribAnchor?: 'upper' | 'lower' | 'ribwings';
   abc?: AbcSerializedState;
@@ -83,6 +104,9 @@ export function buildCanonicalPayload(
     abc?: AbcSerializedState;
     prometheusWings?: boolean;
     ribAnchor?: 'upper' | 'lower' | 'ribwings';
+    headStep?: HeadTurnStep;
+    skullView?: SkullViewMode;
+    bodyView?: BodyTurnView;
     legacyKeys?: LegacyKeyframe[];
   },
 ): RigStatePayload {
@@ -130,10 +154,13 @@ export function buildCanonicalPayload(
   };
 
   if (Object.keys(flipX).length) payload.flipX = flipX;
+  if (extras?.headStep !== undefined) payload.headStep = extras.headStep;
+  if (extras?.skullView) payload.skullView = extras.skullView;
+  if (extras?.bodyView && extras.bodyView !== 'front') payload.bodyView = extras.bodyView;
   if (extras?.prometheusWings) payload.prometheusWings = true;
   if (extras?.ribAnchor && extras.ribAnchor !== 'upper') payload.ribAnchor = extras.ribAnchor;
   if (extras?.abc) {
-    const hasAnyAbc = !!(extras.abc.poses.A || extras.abc.poses.B || extras.abc.poses.C || extras.abc.poses.D || extras.abc.poses.E);
+    const hasAnyAbc = !!(extras.abc.poses.A || extras.abc.poses.B || extras.abc.poses.C);
     if (hasAnyAbc) payload.abc = extras.abc;
   }
   if (extras?.legacyKeys?.length) {
@@ -224,11 +251,34 @@ export function parseAndValidateRigPayload(rawJson: string): RigStatePayload {
 
   const out: RigStatePayload = { pose, coords, keys, root, parts };
   if (raw.flipX && typeof raw.flipX === 'object') out.flipX = raw.flipX as Record<string, boolean>;
+  if (raw.headStep === 0 || raw.headStep === 1 || raw.headStep === 2 || raw.headStep === 3) {
+    out.headStep = raw.headStep;
+  }
+  if (raw.skullView === 'front' || raw.skullView === 'side' || raw.skullView === 'back') {
+    out.skullView = raw.skullView;
+  }
+  const parsedBodyView = parseBodyTurnView(raw.bodyView);
+  if (parsedBodyView) {
+    out.bodyView = parsedBodyView;
+  }
   if (typeof raw.prometheusWings === 'boolean') out.prometheusWings = raw.prometheusWings;
   if (raw.ribAnchor === 'upper' || raw.ribAnchor === 'lower' || raw.ribAnchor === 'ribwings') {
     out.ribAnchor = raw.ribAnchor;
   }
-  if (raw.abc && typeof raw.abc === 'object') out.abc = raw.abc as AbcSerializedState;
+  if (raw.abc && typeof raw.abc === 'object') {
+    const rawAbc = raw.abc as Partial<AbcSerializedState> & { poses?: Record<string, unknown> };
+    const slot = rawAbc.activeSlot;
+    out.abc = {
+      ...(rawAbc as AbcSerializedState),
+      activeSlot: slot === 'B' || slot === 'C' ? slot : 'A',
+      skullTurnTiming: rawAbc.skullTurnTiming === 'nextLetter' ? 'nextLetter' : 'halfway',
+      poses: {
+        A: (rawAbc.poses?.A as AbcSerializedState['poses']['A']) ?? null,
+        B: (rawAbc.poses?.B as AbcSerializedState['poses']['B']) ?? null,
+        C: (rawAbc.poses?.C as AbcSerializedState['poses']['C']) ?? null,
+      },
+    };
+  }
   if (legacyKeys.length) out.legacyKeys = legacyKeys;
   return out;
 }
@@ -239,6 +289,9 @@ export function payloadToPoseSnapshot(p: RigStatePayload): Partial<PoseSnapshot>
     coords: { ...p.coords },
     root: [...p.root],
     flipX: p.flipX,
+    headStep: p.headStep,
+    skullView: p.skullView,
+    bodyView: p.bodyView,
     prometheusWings: p.prometheusWings,
     abc: p.abc,
     parts: p.parts as PoseSnapshot['parts'],

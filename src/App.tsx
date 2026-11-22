@@ -62,6 +62,8 @@ import {
   HEAD_TURN_SEQUENCE,
   applyHeadTurnStep,
   getHeadTurnStep,
+  preloadSkullAssets,
+  resolvePoseHeadTurnStep,
   type HeadTurnStep,
   type SkullViewMode,
 } from './engine/skullKitModels';
@@ -101,6 +103,7 @@ import {
   getAbcNodeLag,
   getFilledAbcSlots,
   nextAbcSlot,
+  synthesizeProceduralInBetween,
 } from './engine/motionEngine';
 import { PartRigManager } from './engine/partRigEngine';
 import { LIMB_CHAINS } from './engine/rigMetadata';
@@ -129,6 +132,7 @@ import type {
   RigNode,
   RigPiece,
   SavedPoseEntry,
+  SkullTurnTiming,
 } from './engine/types';
 
 const STORAGE_KEY = 'bpz_v1';
@@ -389,7 +393,6 @@ export default function App() {
   const [modelSplitPct, setModelSplitPct] = useState(46);
   const [partHeightPct, setPartHeightPct] = useState(92);
   const [abcPlaying, setAbcPlaying] = useState(false);
-  const [unlockedAbcSlots, setUnlockedAbcSlots] = useState(3);
   const [savedPoses, setSavedPoses] = useState<SavedPoseEntry[]>(loadPoseLibrary);
 
   // React mirrors for toolbar & panels
@@ -416,6 +419,8 @@ export default function App() {
         abc: abcRef.current,
         prometheusWings: rt.prometheusWings,
         ribAnchor: rt.ribAnchor,
+        headStep: rt.headStep,
+        skullView: rt.skullView,
         legacyKeys: rt.keys,
       },
     );
@@ -596,6 +601,14 @@ export default function App() {
             rt.constrainLimits,
             rt.by,
             rt.prometheusWings,
+            {
+              skullTurnTiming: abc.skullTurnTiming ?? 'halfway',
+              onHeadTurn: (step, spec) => {
+                rt.headStep = step;
+                rt.skullView = spec.view;
+              },
+              onWake: wake,
+            },
           );
           rt.dirty = true;
           rt.actUntil = Math.max(rt.actUntil, performance.now() + 450);
@@ -1037,23 +1050,19 @@ export default function App() {
         rt.canonicalKeys = payload.keys;
         if (parsed.abc) {
           const base = createDefaultAbcState();
+          const rawSlot = parsed.abc.activeSlot;
           abcRef.current = {
             ...base,
             ...parsed.abc,
+            activeSlot: rawSlot === 'B' || rawSlot === 'C' ? rawSlot : 'A',
+            skullTurnTiming: parsed.abc.skullTurnTiming === 'nextLetter' ? 'nextLetter' : 'halfway',
             poses: {
               A: parsed.abc.poses?.A ?? null,
               B: parsed.abc.poses?.B ?? null,
               C: parsed.abc.poses?.C ?? null,
-              D: parsed.abc.poses?.D ?? null,
-              E: parsed.abc.poses?.E ?? null,
             },
             settings: { ...base.settings, ...(parsed.abc.settings ?? {}) },
           };
-          const maxFilled = getFilledAbcSlots(abcRef.current.poses).reduce(
-            (mx, s) => Math.max(mx, ABC_SLOTS.indexOf(s) + 1),
-            3,
-          );
-          setUnlockedAbcSlots((prev) => Math.min(5, Math.max(prev, maxFilled)));
         }
         const nextRibAnchor: RibAnchorMode = payload.ribAnchor ?? 'upper';
         rt.ribAnchor = nextRibAnchor;
@@ -1084,7 +1093,18 @@ export default function App() {
         snapSpringRef.current = null;
         benchmarkMsgRef.current = false;
         jsonEditingRef.current = false;
-        rt.headStep = getHeadTurnStep(rt.skullView, !!rt.by.head?.flipX);
+        if (rt.by.head && (parsed.headStep !== undefined || parsed.skullView !== undefined)) {
+          const loadedStep = resolvePoseHeadTurnStep({
+            headStep: parsed.headStep,
+            skullView: parsed.skullView,
+            flipX: parsed.flipX,
+          });
+          const spec = applyHeadTurnStep(rt.by.head, loadedStep, wake);
+          rt.headStep = loadedStep;
+          rt.skullView = spec.view;
+        } else {
+          rt.headStep = getHeadTurnStep(rt.skullView, !!rt.by.head?.flipX);
+        }
         ikPinsRef.current = syncPinsFromRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, ikPinsRef.current);
         syncUi();
         wake();
@@ -1122,7 +1142,13 @@ export default function App() {
       if (!rt || !mgr || !target) return;
 
       snapSpringRef.current = null;
-      const fromPose = captureAbcPose(rt.nodes, rt.root, mgr.inst);
+      const fromPose = captureAbcPose(rt.nodes, rt.root, mgr.inst, {
+        headStep: rt.headStep,
+        skullView: rt.skullView,
+      });
+      if (resolvePoseHeadTurnStep(fromPose) !== 0 || resolvePoseHeadTurnStep(target) !== 0) {
+        preloadSkullAssets();
+      }
       const abc = abcRef.current;
       const fpsPeriod = 1000 / Math.max(1, abc.fps);
       const totalF = Math.max(1, abc.snapFrames);
@@ -1153,12 +1179,11 @@ export default function App() {
       const mgr = partMgrRef.current;
       if (!rt || !mgr) return;
       stopAbcLoop();
-      abcRef.current.poses[slot] = captureAbcPose(rt.nodes, rt.root, mgr.inst);
+      abcRef.current.poses[slot] = captureAbcPose(rt.nodes, rt.root, mgr.inst, {
+        headStep: rt.headStep,
+        skullView: rt.skullView,
+      });
       abcRef.current.activeSlot = slot;
-      const slotIdx = ABC_SLOTS.indexOf(slot);
-      if (slotIdx >= 2) {
-        setUnlockedAbcSlots((prev) => Math.min(5, Math.max(prev, slotIdx + 2)));
-      }
       syncUi();
       wake();
       window.clearTimeout(copyToastTimerRef.current);
@@ -1167,6 +1192,49 @@ export default function App() {
     },
     [stopAbcLoop, syncUi, wake],
   );
+
+  const handleGenerateProceduralAbcB = useCallback(() => {
+    const rt = rtRef.current;
+    const mgr = partMgrRef.current;
+    if (!rt || !mgr) return;
+    const poseA = abcRef.current.poses.A;
+    const poseC = abcRef.current.poses.C;
+    if (!poseA || !poseC || abcRef.current.poses.B) return;
+
+    stopAbcLoop();
+    const generated = synthesizeProceduralInBetween(
+      poseA,
+      poseC,
+      rt.nodes,
+      rt.root,
+      mgr.inst,
+      (I) => mgr.rebake(I, wake),
+      {
+        by: rt.by,
+        bondOn: rt.bondOn,
+        wingPop: rt.wingPop,
+        ribAnchor: rt.ribAnchor,
+        constrainLimits: rt.constrainLimits,
+        prometheusWings: rt.prometheusWings,
+        groundY: ikConfigRef.current.groundY,
+        footGravity: ikConfigRef.current.footGravity,
+      },
+    );
+    abcRef.current.poses.B = generated;
+    abcRef.current.activeSlot = 'B';
+    const nextStep = resolvePoseHeadTurnStep(generated);
+    rt.headStep = nextStep;
+    rt.skullView = HEAD_TURN_SEQUENCE[nextStep].view;
+    sidePoseRef.current = null;
+    snapSpringRef.current = null;
+    ikPinsRef.current = syncPinsFromRig(rt.nodes, rt.by, rt.bondOn, rt.wingPop, ikPinsRef.current);
+    clampRtCamera();
+    syncUi();
+    wake();
+    window.clearTimeout(copyToastTimerRef.current);
+    setCopyToast('Procedural In-Between A↔C → B');
+    copyToastTimerRef.current = window.setTimeout(() => setCopyToast(null), 1900);
+  }, [clampRtCamera, stopAbcLoop, syncUi, wake]);
 
   const persistPoseLibrary = useCallback((next: SavedPoseEntry[]) => {
     try {
@@ -1193,7 +1261,10 @@ export default function App() {
       const mgr = partMgrRef.current;
       if (!rt || !mgr) return;
       const now = Date.now();
-      const pose = captureAbcPose(rt.nodes, rt.root, mgr.inst);
+      const pose = captureAbcPose(rt.nodes, rt.root, mgr.inst, {
+        headStep: rt.headStep,
+        skullView: rt.skullView,
+      });
       const savedName = rawName?.trim() || `Pose ${savedPoses.length + 1}`;
       const entry: SavedPoseEntry = {
         id: `pose_${now}_${Math.random().toString(36).slice(2, 7)}`,
@@ -1217,7 +1288,18 @@ export default function App() {
       const mgr = partMgrRef.current;
       if (!rt || !mgr) return;
       stopAbcLoop();
-      applyAbcPoseInstant(entry.pose, rt.nodes, rt.root, mgr.inst, (I) => mgr.rebake(I, wake));
+      applyAbcPoseInstant(
+        entry.pose,
+        rt.nodes,
+        rt.root,
+        mgr.inst,
+        (I) => mgr.rebake(I, wake),
+        (step, spec) => {
+          rt.headStep = step;
+          rt.skullView = spec.view;
+        },
+        wake,
+      );
       const wingsOn = !!entry.prometheusWings;
       rt.prometheusWings = wingsOn;
       rt.wingTarget = wingsOn ? 1 : 0;
@@ -1252,11 +1334,18 @@ export default function App() {
       stopAbcLoop();
       abcRef.current.poses[slot] = JSON.parse(JSON.stringify(entry.pose)) as AbcPoseRecord;
       abcRef.current.activeSlot = slot;
-      const slotIdx = ABC_SLOTS.indexOf(slot);
-      if (slotIdx >= 2) {
-        setUnlockedAbcSlots((prev) => Math.min(5, Math.max(prev, slotIdx + 1)));
-      }
-      applyAbcPoseInstant(entry.pose, rt.nodes, rt.root, mgr.inst, (I) => mgr.rebake(I, wake));
+      applyAbcPoseInstant(
+        entry.pose,
+        rt.nodes,
+        rt.root,
+        mgr.inst,
+        (I) => mgr.rebake(I, wake),
+        (step, spec) => {
+          rt.headStep = step;
+          rt.skullView = spec.view;
+        },
+        wake,
+      );
       const wingsOn = !!entry.prometheusWings;
       rt.prometheusWings = wingsOn;
       rt.wingTarget = wingsOn ? 1 : 0;
@@ -1287,7 +1376,10 @@ export default function App() {
       const rt = rtRef.current;
       const mgr = partMgrRef.current;
       if (!rt || !mgr) return;
-      const pose = captureAbcPose(rt.nodes, rt.root, mgr.inst);
+      const pose = captureAbcPose(rt.nodes, rt.root, mgr.inst, {
+        headStep: rt.headStep,
+        skullView: rt.skullView,
+      });
       const now = Date.now();
       const target = savedPoses.find((item) => item.id === id);
       updateSavedPoses((prev) =>
@@ -1417,6 +1509,14 @@ export default function App() {
         rt.constrainLimits,
         rt.by,
         rt.prometheusWings,
+        {
+          skullTurnTiming: abc.skullTurnTiming ?? 'halfway',
+          onHeadTurn: (step, spec) => {
+            rt.headStep = step;
+            rt.skullView = spec.view;
+          },
+          onWake: wake,
+        },
       );
       syncUi();
       wake();
@@ -3499,17 +3599,15 @@ export default function App() {
               abc={abcRef.current}
               playing={abcPlaying}
               scrubProgress={abcScrubRef.current}
-              unlockedSlots={unlockedAbcSlots}
               savedPoses={savedPoses}
-              onUnlockNextSlot={() => setUnlockedAbcSlots((prev) => Math.min(5, prev + 1))}
               onCaptureSlot={handleCaptureAbcSlot}
+              onGenerateProceduralB={handleGenerateProceduralAbcB}
               onJumpSlot={handleJumpAbcSlot}
               onClearSlots={() => {
                 stopAbcLoop();
-                abcRef.current.poses = { A: null, B: null, C: null, D: null, E: null };
+                abcRef.current.poses = { A: null, B: null, C: null };
                 abcRef.current.activeSlot = 'A';
                 abcScrubRef.current = 0;
-                setUnlockedAbcSlots(3);
                 syncUi();
                 wake();
               }}
@@ -3547,6 +3645,10 @@ export default function App() {
               }}
               onToggleSteppedFps={(stepped) => {
                 abcRef.current.steppedFps = stepped;
+                syncUi();
+              }}
+              onSkullTurnTimingChange={(timing: SkullTurnTiming) => {
+                abcRef.current.skullTurnTiming = timing;
                 syncUi();
               }}
               onScrubCycle={handleScrubAbcCycle}

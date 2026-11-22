@@ -4,16 +4,18 @@
  *   head turntable buttons), 43-Bone hierarchy slider, ABC Keyframes & Motion Curves,
  *   Pose Library, Data JSON/BSK import-export, IK & Elastic Pin settings, and About guide.
  */
-import React, { useMemo, useRef, useState } from 'react';
-import { getTensionRatio, toPure360, type RibAnchorMode } from '../engine/fkEngine';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { getTensionRatio, toPure360, type CoreTriangleState, type RibAnchorMode } from '../engine/fkEngine';
 import { EFFECTOR_IDS, IK_MODE_LABELS } from '../engine/ikEngine';
 import { ABC_SLOTS, FPS_PRESETS, getFilledAbcSlots, sampleMotionCurvePath } from '../engine/motionEngine';
 import { GITHUB_ROADMAP, LIMB_CHAINS } from '../engine/rigMetadata';
 import { HEAD_TURN_SEQUENCE, type HeadTurnStep, type SkullViewMode } from '../engine/skullKitModels';
+import { BODY_TURN_VIEWS } from '../engine/turnaround';
 import type {
   AbcLoopMode,
   AbcSerializedState,
   AbcSlot,
+  BodyTurnView,
   BondStatusItem,
   IKConfig,
   IKMode,
@@ -25,6 +27,7 @@ import type {
   PerspectiveState,
   RigNode,
   SavedPoseEntry,
+  SkullTurnTiming,
 } from '../engine/types';
 
 interface PosePanelProps {
@@ -55,6 +58,9 @@ interface PosePanelProps {
   onSkullViewChange?: (view: SkullViewMode) => void;
   headTurnStep?: HeadTurnStep;
   onHeadTurnStep?: (step: HeadTurnStep) => void;
+  bodyView?: BodyTurnView;
+  onBodyViewChange?: (view: BodyTurnView) => void;
+  coreTriangleState?: CoreTriangleState | null;
   onApplyPreset?: (id: 'chungus' | 'promethean') => void;
   onMirrorSide?: (mode: 'RtoLArms' | 'LtoRSide') => void;
 }
@@ -87,6 +93,9 @@ export const PosePanel: React.FC<PosePanelProps> = ({
   onSkullViewChange,
   headTurnStep = 0,
   onHeadTurnStep,
+  bodyView = 'front',
+  onBodyViewChange,
+  coreTriangleState,
   onApplyPreset,
   onMirrorSide,
 }) => {
@@ -245,6 +254,11 @@ export const PosePanel: React.FC<PosePanelProps> = ({
             {tension.atLimit ? 'tension · anatomical limit reached' : 'tension · approaching joint limit'}
           </div>
         )}
+        {coreTriangleState && (
+          <div className={coreTriangleState.strained ? 'text-[#f59e0b]' : 'text-[#8b919c]'}>
+            {coreTriangleState.side} core triangle · {coreTriangleState.mode === 'elastic' ? 'elastic buffer' : 'mechanical detent'} · {Math.round(coreTriangleState.bufferFactor * 100)}%
+          </div>
+        )}
       </div>
 
       {onRibAnchorModeChange && (
@@ -275,6 +289,35 @@ export const PosePanel: React.FC<PosePanelProps> = ({
                 {label}
               </button>
             ))}
+          </div>
+        </div>
+      )}
+
+      {onBodyViewChange && (
+        <div className="space-y-1 border-t border-[#2b2f36] pt-2">
+          <div className="flex items-center justify-between text-[10.5px]">
+            <span className="font-semibold text-[#8b919c] uppercase">Body View</span>
+            <span className="text-[#8b919c]">Turnaround · side contrapposto</span>
+          </div>
+          <div className="grid grid-cols-3 gap-1">
+            {BODY_TURN_VIEWS.map((spec) => {
+              const active = bodyView === spec.id;
+              return (
+                <button
+                  key={spec.id}
+                  type="button"
+                  title={spec.hint}
+                  onClick={() => onBodyViewChange(spec.id)}
+                  className={`rounded border px-1.5 py-1 text-[10.5px] font-medium transition-colors ${
+                    active
+                      ? 'border-[#a855f7] bg-[#a855f7]/25 text-[#e9d5ff]'
+                      : 'border-[#2b2f36] bg-[#121315] text-[#c7cbd3] hover:border-[#a855f7]/60 hover:text-white'
+                  }`}
+                >
+                  {spec.label}
+                </button>
+              );
+            })}
           </div>
         </div>
       )}
@@ -408,9 +451,17 @@ interface BonesPanelProps {
   onSelect: (node: RigNode) => void;
   onRotateNode: (node: RigNode, deg: number) => void;
   onHover?: (node: RigNode | null) => void;
+  onDoubleClickNode?: (node: RigNode) => void;
 }
 
-export const BonesPanel: React.FC<BonesPanelProps> = ({ nodes, selectedId, onSelect, onRotateNode, onHover }) => {
+export const BonesPanel: React.FC<BonesPanelProps> = ({
+  nodes,
+  selectedId,
+  onSelect,
+  onRotateNode,
+  onHover,
+  onDoubleClickNode,
+}) => {
   const dragRef = useRef<{
     node: RigNode;
     startX: number;
@@ -515,7 +566,8 @@ export const BonesPanel: React.FC<BonesPanelProps> = ({ nodes, selectedId, onSel
           <button
             key={n.id}
             type="button"
-            title={`${n.name} (${n.parent ? `child of ${n.parent}` : 'root'}) · Click to select · Drag horizontally for continuous 360° rotation`}
+            title={`${n.name} (${n.parent ? `child of ${n.parent}` : 'root'}) · Click to select · Drag for 360° · Double-click to correct to parent`}
+            onDoubleClick={() => onDoubleClickNode?.(n)}
             onPointerDown={(e) => {
               if (e.button !== 0) return;
               e.currentTarget.setPointerCapture(e.pointerId);
@@ -670,10 +722,9 @@ interface TimelinePanelProps {
   abc: AbcSerializedState;
   playing: boolean;
   scrubProgress: number;
-  unlockedSlots: number;
   savedPoses: SavedPoseEntry[];
-  onUnlockNextSlot: () => void;
   onCaptureSlot: (slot: AbcSlot) => void;
+  onGenerateProceduralB: () => void;
   onJumpSlot: (slot: AbcSlot) => void;
   onClearSlots: () => void;
   onStep: () => void;
@@ -686,6 +737,7 @@ interface TimelinePanelProps {
   onSnapFramesChange: (frames: number) => void;
   onFpsChange: (fps: number) => void;
   onToggleSteppedFps: (stepped: boolean) => void;
+  onSkullTurnTimingChange: (timing: SkullTurnTiming) => void;
   onScrubCycle: (progress: number) => void;
   onQuickSaveToLibrary: () => void;
   onApplyLibraryPose: (entry: SavedPoseEntry) => void;
@@ -701,14 +753,20 @@ const FEEL_OPTIONS: Array<{ id: MotionFeel; label: string; title: string }> = [
   { id: 'clockwork', label: 'Clock', title: 'Precision brass gear teeth & pawl ratchet indexing' },
 ];
 
+const EASE_FEEL_OPTIONS: Array<{ id: MotionFeel; label: string; title: string }> = [
+  { id: 'easeIn', label: 'Ease In', title: 'Slow accelerating start building into a brisk pose arrival' },
+  { id: 'easeOut', label: 'Ease Out', title: 'Crisp departure gliding smoothly into a soft cushioned settle' },
+  { id: 'doubleEase', label: 'Double Ease', title: 'Symmetric ease-in & ease-out S-curve at both keyframe ends' },
+  { id: 'proceduralEase', label: 'Procedural', title: 'Forges a clean C2 path with overlap, passing arcs, and anatomical limits automatically' },
+];
+
 export const TimelinePanel: React.FC<TimelinePanelProps> = ({
   abc,
   playing,
   scrubProgress,
-  unlockedSlots,
   savedPoses,
-  onUnlockNextSlot,
   onCaptureSlot,
+  onGenerateProceduralB,
   onJumpSlot,
   onClearSlots,
   onStep,
@@ -721,21 +779,26 @@ export const TimelinePanel: React.FC<TimelinePanelProps> = ({
   onSnapFramesChange,
   onFpsChange,
   onToggleSteppedFps,
+  onSkullTurnTimingChange,
   onScrubCycle,
   onQuickSaveToLibrary,
   onApplyLibraryPose,
   onLoadLibraryPoseToSlot,
   onOpenLibraryTab,
 }) => {
+  const bClickTimerRef = useRef<number | null>(null);
+  useEffect(() => {
+    return () => {
+      if (bClickTimerRef.current !== null) window.clearTimeout(bClickTimerRef.current);
+    };
+  }, []);
+
   const filled = getFilledAbcSlots(abc.poses);
   const canAnimate = filled.length >= 2;
+  const onlyAandC = !!abc.poses.A && !!abc.poses.C && !abc.poses.B;
   const durMs = Math.round((Math.max(1, abc.snapFrames) * 1000) / Math.max(1, abc.fps));
 
-  const highestFilledIdx = filled.reduce((mx, s) => Math.max(mx, ABC_SLOTS.indexOf(s)), -1);
-  const activeIdx = ABC_SLOTS.indexOf(abc.activeSlot);
-  const visibleCount = Math.min(5, Math.max(3, unlockedSlots, highestFilledIdx + 1, activeIdx + 1));
-  const visibleSlots = ABC_SLOTS.slice(0, visibleCount);
-  const nextSlotToUnlock = visibleCount < 5 ? ABC_SLOTS[visibleCount] : null;
+  const visibleSlots = ABC_SLOTS;
   const loopSlots = filled.length >= 2 ? filled : visibleSlots;
 
   const curveGeometry = useMemo(() => {
@@ -764,41 +827,23 @@ export const TimelinePanel: React.FC<TimelinePanelProps> = ({
       ? 'border-[#a855f7] bg-[#7e22ce] text-white'
       : s === 'B'
       ? 'border-[#10b981] bg-[#059669] text-white'
-      : s === 'C'
-      ? 'border-[#ff3b6b] bg-[#be123c] text-white'
-      : s === 'D'
-      ? 'border-[#fbbf24] bg-[#b45309] text-white'
-      : 'border-[#38bdf8] bg-[#0369a1] text-white';
+      : 'border-[#ff3b6b] bg-[#be123c] text-white';
 
   const slotBadgeClass = (s: AbcSlot) =>
     s === 'A'
       ? 'border-[#a855f7]/45 text-[#c084fc] hover:border-[#a855f7] hover:bg-[#7e22ce] hover:text-white'
       : s === 'B'
       ? 'border-[#10b981]/45 text-[#34d399] hover:border-[#10b981] hover:bg-[#059669] hover:text-white'
-      : s === 'C'
-      ? 'border-[#ff3b6b]/45 text-[#ff6b8f] hover:border-[#ff3b6b] hover:bg-[#be123c] hover:text-white'
-      : s === 'D'
-      ? 'border-[#fbbf24]/45 text-[#fbbf24] hover:border-[#fbbf24] hover:bg-[#b45309] hover:text-white'
-      : 'border-[#38bdf8]/45 text-[#38bdf8] hover:border-[#38bdf8] hover:bg-[#0369a1] hover:text-white';
+      : 'border-[#ff3b6b]/45 text-[#ff6b8f] hover:border-[#ff3b6b] hover:bg-[#be123c] hover:text-white';
 
   return (
     <div className="space-y-2 text-[11.5px]">
-      {/* Keyframes Header status + Slot unlock (+D / +E) + Clear */}
+      {/* Keyframes Header status + Clear */}
       <div className="flex items-center justify-between gap-1.5">
         <span className="min-w-0 truncate font-mono-tabular text-[11px] font-medium text-[#34d399]">
-          {filled.length ? `Live: ${abc.activeSlot} (${filled.join('·')})` : `Slots: ${visibleSlots.join('·')}`}
+          {filled.length ? `Live: ${abc.activeSlot} (${filled.join('·')})` : 'Slots: A·B·C'}
         </span>
         <div className="flex shrink-0 items-center gap-1">
-          {nextSlotToUnlock && (
-            <button
-              type="button"
-              onClick={onUnlockNextSlot}
-              title={`Activate Pose Slot ${nextSlotToUnlock} (up to 5 poses)`}
-              className="rounded border border-[#a855f7]/50 bg-[#a855f7]/15 px-1.5 py-0.5 text-[10.5px] font-semibold text-[#d8b4fe] transition-colors hover:bg-[#a855f7]/30"
-            >
-              +{nextSlotToUnlock}
-            </button>
-          )}
           {filled.length > 0 && (
             <button
               type="button"
@@ -812,36 +857,68 @@ export const TimelinePanel: React.FC<TimelinePanelProps> = ({
         </div>
       </div>
 
-      {/* Set Keyframe Slots (squeezes A..E into exact same row width as activated) */}
-      <div className="flex items-center gap-1.5">
-        <span className="w-9 shrink-0 text-[11px] text-[#8b919c]">Set</span>
-        <div className="flex min-w-0 flex-1 items-center gap-1">
-          {visibleSlots.map((s) => {
-            const hasPose = !!abc.poses[s];
-            const isLive = abc.activeSlot === s;
-            return (
-              <button
-                key={s}
-                type="button"
-                onClick={() => onCaptureSlot(s)}
-                title={`Capture current live pose into Keyframe ${s}`}
-                className={`min-w-0 flex-1 whitespace-nowrap rounded border px-1 py-1 text-[11px] transition-colors ${
-                  isLive && hasPose
-                    ? `${slotColor(s)} font-bold`
-                    : hasPose
-                    ? 'border-[#a855f7]/60 bg-[#121315] font-bold text-[#e6e8ec] hover:border-[#a855f7]'
-                    : 'border-[#2b2f36] bg-[#121315] font-medium text-[#c7cbd3] hover:border-[#10b981] hover:text-[#34d399]'
-                }`}
-              >
-                {s}
-                {hasPose ? '●' : ''}
-              </button>
-            );
-          })}
+      {/* Set Keyframe Slots (A / B / C; double-click B when only A & C are set for procedural in-between) */}
+      <div className="space-y-1">
+        <div className="flex items-center gap-1.5">
+          <span className="w-9 shrink-0 text-[11px] text-[#8b919c]">Set</span>
+          <div className="flex min-w-0 flex-1 items-center gap-1">
+            {visibleSlots.map((s) => {
+              const hasPose = !!abc.poses[s];
+              const isLive = abc.activeSlot === s;
+              const isProceduralReadyB = s === 'B' && onlyAandC;
+              return (
+                <button
+                  key={s}
+                  type="button"
+                  onClick={() => {
+                    if (isProceduralReadyB) {
+                      if (bClickTimerRef.current !== null) window.clearTimeout(bClickTimerRef.current);
+                      bClickTimerRef.current = window.setTimeout(() => {
+                        bClickTimerRef.current = null;
+                        onCaptureSlot('B');
+                      }, 220);
+                      return;
+                    }
+                    onCaptureSlot(s);
+                  }}
+                  onDoubleClick={() => {
+                    if (s !== 'B' || !onlyAandC) return;
+                    if (bClickTimerRef.current !== null) {
+                      window.clearTimeout(bClickTimerRef.current);
+                      bClickTimerRef.current = null;
+                    }
+                    onGenerateProceduralB();
+                  }}
+                  title={
+                    isProceduralReadyB
+                      ? 'Click to capture live pose to B · Double-click B for procedural A↔C in-between'
+                      : `Capture current live pose into Keyframe ${s}`
+                  }
+                  className={`min-w-0 flex-1 whitespace-nowrap rounded border px-1 py-1 text-[11px] transition-colors ${
+                    isLive && hasPose
+                      ? `${slotColor(s)} font-bold`
+                      : hasPose
+                      ? 'border-[#a855f7]/60 bg-[#121315] font-bold text-[#e6e8ec] hover:border-[#a855f7]'
+                      : isProceduralReadyB
+                      ? 'border-dashed border-[#10b981]/80 bg-[#10b981]/10 font-semibold text-[#34d399] hover:border-[#10b981] hover:bg-[#10b981]/20'
+                      : 'border-[#2b2f36] bg-[#121315] font-medium text-[#c7cbd3] hover:border-[#10b981] hover:text-[#34d399]'
+                  }`}
+                >
+                  {s}
+                  {hasPose ? '●' : ''}
+                </button>
+              );
+            })}
+          </div>
         </div>
+        {onlyAandC && (
+          <div className="pl-10 text-[10px] text-[#34d399]/90">
+            2 frames on A &amp; C · double-click <span className="font-semibold text-[#34d399]">B</span> for procedural in-between
+          </div>
+        )}
       </div>
 
-      {/* Jump Keyframe Slots (squeezes A..E into exact same row width as activated) */}
+      {/* Jump Keyframe Slots (A / B / C) */}
       <div className="flex items-center gap-1.5">
         <span className="w-9 shrink-0 text-[11px] text-[#8b919c]">Jump</span>
         <div className="flex min-w-0 flex-1 items-center gap-1">
@@ -907,7 +984,7 @@ export const TimelinePanel: React.FC<TimelinePanelProps> = ({
         <select
           value={abc.loopMode}
           onChange={(e) => onLoopModeChange(e.target.value as AbcLoopMode)}
-          title="Loop order across 2-5 saved poses"
+          title="Loop order across A, B, C saved poses"
           className="w-full rounded border border-[#2b2f36] bg-[#0e0f11] px-2 py-1 text-[11.5px] text-[#e6e8ec] focus:border-[#a855f7] focus:outline-none"
         >
           <option value="pingpong">Ping-Pong ({loopSlots.join(' ↔ ')})</option>
@@ -933,9 +1010,9 @@ export const TimelinePanel: React.FC<TimelinePanelProps> = ({
         )}
       </div>
 
-      {/* Motion Feel Selector (Flow / Snap / Elastic / Mech / Clock) */}
+      {/* Motion Feel Selector (Row 1: Flow / Snap / Elastic / Mech / Clock; Row 2: Ease In / Ease Out / Double Ease / Procedural) */}
       <div className="border-t border-[#2b2f36] pt-2">
-        <div className="mb-1.5 flex items-center gap-1">
+        <div className="mb-1 flex items-center gap-1">
           {FEEL_OPTIONS.map((opt) => {
             const active = abc.feel === opt.id;
             return (
@@ -947,6 +1024,29 @@ export const TimelinePanel: React.FC<TimelinePanelProps> = ({
                 className={`flex-1 rounded border px-1 py-1 text-[11px] font-medium transition-colors ${
                   active
                     ? 'border-[#10b981] bg-[#10b981]/20 text-[#34d399]'
+                    : 'border-[#2b2f36] bg-[#121315] text-[#c7cbd3] hover:border-[#a855f7]/60 hover:text-white'
+                }`}
+              >
+                {opt.label}
+              </button>
+            );
+          })}
+        </div>
+
+        <div className="mb-1.5 flex items-center gap-1">
+          {EASE_FEEL_OPTIONS.map((opt) => {
+            const active = abc.feel === opt.id;
+            return (
+              <button
+                key={opt.id}
+                type="button"
+                title={opt.title}
+                onClick={() => onFeelChange(opt.id)}
+                className={`min-w-0 flex-1 whitespace-nowrap rounded border px-1 py-1 text-[10.5px] font-medium transition-colors ${
+                  active
+                    ? opt.id === 'proceduralEase'
+                      ? 'border-[#a855f7] bg-[#a855f7]/20 text-[#d8b4fe]'
+                      : 'border-[#10b981] bg-[#10b981]/20 text-[#34d399]'
                     : 'border-[#2b2f36] bg-[#121315] text-[#c7cbd3] hover:border-[#a855f7]/60 hover:text-white'
                 }`}
               >
@@ -983,7 +1083,13 @@ export const TimelinePanel: React.FC<TimelinePanelProps> = ({
             <path
               d={curveGeometry.d}
               fill="none"
-              stroke={abc.feel === 'elastic' ? '#ff3b6b' : abc.feel === 'clockwork' ? '#c084fc' : '#22c55e'}
+              stroke={
+                abc.feel === 'elastic'
+                  ? '#ff3b6b'
+                  : abc.feel === 'clockwork' || abc.feel === 'proceduralEase'
+                  ? '#c084fc'
+                  : '#22c55e'
+              }
               strokeWidth="1.75"
               strokeLinecap="round"
               strokeLinejoin="round"
@@ -995,6 +1101,54 @@ export const TimelinePanel: React.FC<TimelinePanelProps> = ({
         {abc.feel === 'flow' && (
           <div className="text-[11px] text-[#8b919c]">
             Pure un-eased linear motion hitting every pose on an exact interval.
+          </div>
+        )}
+
+        {(abc.feel === 'easeIn' || abc.feel === 'easeOut' || abc.feel === 'doubleEase') && (
+          <div className="space-y-1">
+            <div className="flex items-center gap-2">
+              <span className="w-16 shrink-0 text-[10.5px] text-[#a7abb4]">Curve</span>
+              <input
+                type="range"
+                min={0}
+                max={100}
+                value={Math.round(abc.settings.easing * 100)}
+                onChange={(e) => onUpdateSettings({ easing: +e.target.value / 100 })}
+                className="studio-range flex-1"
+              />
+              <span className="font-mono-tabular w-8 text-right text-[10.5px] text-[#34d399]">
+                {Math.round(abc.settings.easing * 100)}%
+              </span>
+            </div>
+            <div className="text-[10.5px] text-[#8b919c]">
+              {abc.feel === 'easeIn'
+                ? 'Slow coil out of the pose, accelerating crisply into landing.'
+                : abc.feel === 'easeOut'
+                ? 'Brisk launch tapering softly into a clean cushioned settle.'
+                : 'Symmetric ease-in & ease-out S-curve across both keyframe ends.'}
+            </div>
+          </div>
+        )}
+
+        {abc.feel === 'proceduralEase' && (
+          <div className="space-y-1">
+            <div className="flex items-center gap-2">
+              <span className="w-16 shrink-0 text-[10.5px] text-[#a7abb4]">Overlap</span>
+              <input
+                type="range"
+                min={0}
+                max={45}
+                value={Math.round(abc.settings.stagger * 100)}
+                onChange={(e) => onUpdateSettings({ stagger: +e.target.value / 100 })}
+                className="studio-range flex-1"
+              />
+              <span className="font-mono-tabular w-8 text-right text-[10.5px] text-[#c084fc]">
+                {Math.round(abc.settings.stagger * 100)}%
+              </span>
+            </div>
+            <div className="text-[10.5px] text-[#8b919c]">
+              Engine forges a clean path automatically with C2 smoothing, limb overlap &amp; passing arcs.
+            </div>
           </div>
         )}
 
@@ -1266,6 +1420,41 @@ export const TimelinePanel: React.FC<TimelinePanelProps> = ({
           </label>
         </div>
 
+        <div className="flex items-center justify-between gap-2 text-[11px]">
+          <span
+            className="text-[#8b919c]"
+            title="When 360° skull rotation switches during animations: halfway between letters or precisely on the next letter"
+          >
+            Skull Turn
+          </span>
+          <div className="flex items-center gap-1">
+            <button
+              type="button"
+              onClick={() => onSkullTurnTimingChange('halfway')}
+              title="Shift skull rotation halfway between the in-betweens of the letters"
+              className={`rounded border px-1.5 py-0.5 text-[10.5px] font-medium transition-colors ${
+                (abc.skullTurnTiming ?? 'halfway') === 'halfway'
+                  ? 'border-[#10b981] bg-[#10b981]/20 text-[#34d399]'
+                  : 'border-[#2b2f36] bg-[#121315] text-[#8b919c] hover:text-white'
+              }`}
+            >
+              ½ Tween
+            </button>
+            <button
+              type="button"
+              onClick={() => onSkullTurnTimingChange('nextLetter')}
+              title="Hold current skull rotation across in-betweens and activate precisely on the next letter"
+              className={`rounded border px-1.5 py-0.5 text-[10.5px] font-medium transition-colors ${
+                abc.skullTurnTiming === 'nextLetter'
+                  ? 'border-[#a855f7] bg-[#a855f7]/20 text-[#d8b4fe]'
+                  : 'border-[#2b2f36] bg-[#121315] text-[#8b919c] hover:text-white'
+              }`}
+            >
+              On Letter
+            </button>
+          </div>
+        </div>
+
         <div className="font-mono-tabular text-[10.5px] text-[#8b919c]">
           {abc.snapFrames} frames @ {abc.fps} FPS · {durMs}ms/pose
         </div>
@@ -1301,7 +1490,7 @@ export const TimelinePanel: React.FC<TimelinePanelProps> = ({
 
         {savedPoses.length === 0 ? (
           <div className="rounded border border-[#2b2f36]/80 bg-[#0e0f11] px-2 py-1.5 text-[10.5px] text-[#8b919c]">
-            No library poses yet. Save a pose above or in Pose Library to load into A–E.
+            No library poses yet. Save a pose above or in Pose Library to load into A–C.
           </div>
         ) : (
           <div className="max-h-36 space-y-1 overflow-y-auto pr-0.5">
@@ -1424,7 +1613,7 @@ export const PoseLibraryPanel: React.FC<PoseLibraryPanelProps> = ({
       {savedPoses.length === 0 ? (
         <div className="rounded border border-[#2b2f36] bg-[#0e0f11] p-2.5 text-[11.5px] text-[#8b919c]">
           Save your current pose above to store it in the app. Saved poses are automatically available inside{' '}
-          <span className="text-[#34d399]">Keyframes</span> to load into A–E.
+          <span className="text-[#34d399]">Keyframes</span> to load into A–C.
         </div>
       ) : filtered.length === 0 ? (
         <div className="py-3 text-center text-[11.5px] text-[#8b919c]">No poses match &ldquo;{filterText}&rdquo;</div>
@@ -1535,11 +1724,7 @@ export const PoseLibraryPanel: React.FC<PoseLibraryPanelProps> = ({
                           ? 'border-[#a855f7]/50 text-[#c084fc] hover:border-[#a855f7] hover:bg-[#7e22ce] hover:text-white'
                           : s === 'B'
                           ? 'border-[#10b981]/50 text-[#34d399] hover:border-[#10b981] hover:bg-[#059669] hover:text-white'
-                          : s === 'C'
-                          ? 'border-[#ff3b6b]/50 text-[#ff6b8f] hover:border-[#ff3b6b] hover:bg-[#be123c] hover:text-white'
-                          : s === 'D'
-                          ? 'border-[#fbbf24]/50 text-[#fbbf24] hover:border-[#fbbf24] hover:bg-[#b45309] hover:text-white'
-                          : 'border-[#38bdf8]/50 text-[#38bdf8] hover:border-[#38bdf8] hover:bg-[#0369a1] hover:text-white'
+                          : 'border-[#ff3b6b]/50 text-[#ff6b8f] hover:border-[#ff3b6b] hover:bg-[#be123c] hover:text-white'
                       }`}
                     >
                       {s}
@@ -1760,6 +1945,7 @@ interface IKPanelProps {
   persp?: PerspectiveState;
   onTogglePersp?: (enabled: boolean) => void;
   onResetPersp?: () => void;
+  onHorizonChange?: (horizonY: number) => void;
   onUpdateConfig: (patch: Partial<IKConfig>) => void;
   onTogglePin: (effectorId: string) => void;
   onSyncPins: () => void;
@@ -1783,6 +1969,7 @@ export const IKPanel: React.FC<IKPanelProps> = ({
   persp,
   onTogglePersp,
   onResetPersp,
+  onHorizonChange,
   onUpdateConfig,
   onTogglePin,
   onSyncPins,
@@ -2084,6 +2271,30 @@ export const IKPanel: React.FC<IKPanelProps> = ({
             <span>Horizon Y: {Math.round(persp.horizonY)}</span>
             <span>Ground Y: {Math.round(persp.groundY)}</span>
           </div>
+          {onHorizonChange && (
+            <div className="space-y-1 pt-0.5">
+              <div className="flex justify-between text-[11px] text-[#c7cbd3]">
+                <span>Horizon Stance Pitch</span>
+                <span className="font-mono-tabular text-[#c084fc]">
+                  {persp.horizonY > persp.groundY - 3200
+                    ? 'Low · Extended'
+                    : persp.horizonY < persp.groundY - 4500
+                    ? 'High · Flexed'
+                    : 'Level · Neutral'}
+                </span>
+              </div>
+              <input
+                type="range"
+                min={-1400}
+                max={Math.round(persp.groundY + 900)}
+                step={20}
+                value={Math.round(persp.horizonY)}
+                onChange={(e) => onHorizonChange(+e.target.value)}
+                title="Drag horizon low for braced spinal extension or high for compressive forward flexion"
+                className="studio-range w-full"
+              />
+            </div>
+          )}
         </div>
       )}
     </div>

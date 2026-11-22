@@ -2,6 +2,14 @@ import type { GotzHandState } from './gotzHandEngine';
 
 export type RenderMode = 'A' | 'D';
 
+export type SkullViewMode = 'front' | 'side' | 'back';
+
+export type BodyTurnView = 'front' | 'threeQuarterR' | 'threeQuarterL' | 'sideR' | 'sideL' | 'back';
+
+export type HeadTurnStep = 0 | 1 | 2 | 3;
+
+export type SkullTurnTiming = 'halfway' | 'nextLetter';
+
 export type PanelId = 'pose' | 'bones' | 'ik' | 'tl' | 'library' | 'data' | 'roadmap' | 'about';
 
 export type EffectorRole = 'handL' | 'handR' | 'footL' | 'footR' | 'head' | null;
@@ -152,6 +160,7 @@ export interface RigNode {
   pieces: RigPiece[];
   piv: [number, number];
   rest: [number, number];
+  baseRest?: [number, number];
   ang: number;
   tx: number;
   ty: number;
@@ -179,11 +188,20 @@ export interface LimbChainDef {
   bendSign: number;
 }
 
-export type AbcSlot = 'A' | 'B' | 'C' | 'D' | 'E';
+export type AbcSlot = 'A' | 'B' | 'C';
 
 export type AbcLoopMode = 'pingpong' | 'cycle';
 
-export type MotionFeel = 'flow' | 'snap' | 'elastic' | 'mechanical' | 'clockwork';
+export type MotionFeel =
+  | 'flow'
+  | 'snap'
+  | 'elastic'
+  | 'mechanical'
+  | 'clockwork'
+  | 'easeIn'
+  | 'easeOut'
+  | 'doubleEase'
+  | 'proceduralEase';
 
 export interface MotionSettings {
   easing: number;       // 0..1 tension easing for Snap
@@ -217,6 +235,9 @@ export interface AbcPoseRecord {
   nodes: Record<string, number>;
   root: [number, number];
   flipX?: Record<string, boolean>;
+  headStep?: HeadTurnStep;
+  skullView?: SkullViewMode;
+  bodyView?: BodyTurnView;
   parts?: Record<string, PartSerializedState>;
 }
 
@@ -239,6 +260,7 @@ export interface AbcSerializedState {
   steppedFps: boolean;
   ghostVisible: boolean;
   ghostOpacity: number;
+  skullTurnTiming?: SkullTurnTiming;
   settings: MotionSettings;
 }
 
@@ -249,6 +271,9 @@ export interface PoseSnapshot {
   root: [number, number];
   prometheusWings?: boolean;
   flipX?: Record<string, boolean>;
+  headStep?: HeadTurnStep;
+  skullView?: SkullViewMode;
+  bodyView?: BodyTurnView;
   parts?: Record<string, PartSerializedState>;
   abc?: AbcSerializedState;
 }

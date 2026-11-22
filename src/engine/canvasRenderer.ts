@@ -8,7 +8,18 @@
  * - Perspective Grid & Elastic Pin Tethers: Renders Horizon, Ground, Vanishing Point, and
  *   live rubber-band tethers when effectors pull away from full-rig pin anchors.
  */
-import { computeRigWorldBounds, getPieceWorldMatrix, getTensionRatio, mkCanvas, parentOf, pos, samplePieceWorldMask, solveRig } from './fkEngine';
+import {
+  computeRigWorldBounds,
+  evalCoreTriangleState,
+  getPieceWorldMatrix,
+  getTensionRatio,
+  mkCanvas,
+  parentOf,
+  pos,
+  samplePieceWorldMask,
+  solveRig,
+  type RibAnchorMode,
+} from './fkEngine';
 import {
   GOTZ_BUILDS,
   GOTZ_DIGITS,
@@ -18,8 +29,34 @@ import {
   gotzToPuppetOffset,
   solveGotzHand,
 } from './gotzHandEngine';
-import { EFFECTOR_IDS, FBIK_CHAIN_NODES, findLimbChainForNode, footContactInfo, skelFocalX } from './ikEngine';
-import type { AbcPoseRecord, AbcSlot, IKOverlayState, PerspHandle, PerspectiveState, RenderMode, RigNode, RigPiece } from './types';
+import {
+  EFFECTOR_IDS,
+  FBIK_CHAIN_NODES,
+  PIN_DIAMOND_RADIUS_PX,
+  PIN_MAGNETIC_SNAP_RADIUS_PX,
+  distToPinDiamondPx,
+  findLimbChainForNode,
+  footContactInfo,
+  skelFocalX,
+} from './ikEngine';
+import {
+  captureHeadTurnRenderSnapshot,
+  previewHeadTurnStepSync,
+  resolvePoseHeadTurnStep,
+  restoreHeadTurnRenderSnapshot,
+} from './skullKitModels';
+import { applyBodyViewPivots, sortPiecesForBodyView } from './turnaround';
+import type {
+  AbcPoseRecord,
+  AbcSlot,
+  BodyTurnView,
+  IKOverlayState,
+  PerspHandle,
+  PerspectiveState,
+  RenderMode,
+  RigNode,
+  RigPiece,
+} from './types';
 
 const GREEN = '#22c55e';
 const RED = '#ef4444';
@@ -36,8 +73,6 @@ const ABC_TINT: Record<AbcSlot, { fill: string; stroke: string; badge: string }>
   A: { fill: 'rgba(168, 85, 247, 0.36)', stroke: 'rgba(192, 132, 252, 0.88)', badge: '#c084fc' },
   B: { fill: 'rgba(16, 185, 129, 0.34)', stroke: 'rgba(52, 211, 153, 0.88)', badge: '#34d399' },
   C: { fill: 'rgba(255, 59, 107, 0.34)', stroke: 'rgba(255, 107, 143, 0.88)', badge: '#ff6b8f' },
-  D: { fill: 'rgba(251, 191, 36, 0.32)', stroke: 'rgba(251, 191, 36, 0.88)', badge: '#fbbf24' },
-  E: { fill: 'rgba(56, 189, 248, 0.32)', stroke: 'rgba(56, 189, 248, 0.88)', badge: '#38bdf8' },
 };
 
 export interface AbcGhostItem {
@@ -70,6 +105,8 @@ export interface RenderContextState {
   actUntil: number;
   bgColor: string;
   wingPop?: number;
+  bodyView?: BodyTurnView;
+  ribAnchor?: RibAnchorMode;
   abcGhosts?: AbcGhostItem[];
   ikOverlay?: IKOverlayState;
   handRGotz?: GotzHandState;
@@ -412,6 +449,31 @@ export class StageRenderer {
       const q = pos(n, by);
       const tension = getTensionRatio(n);
       const strainedBond = n.bond && Math.abs(n.eff - n.ang) > 0.05;
+      if (n.id === 'lip') {
+        const [ux, uy] = this.getHeadAxis(by);
+        ctx.save();
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.globalAlpha = analog ? 0.38 : 0.92;
+        ctx.strokeStyle = n === sel ? MAGENTA : GREEN;
+        ctx.lineWidth = (analog ? 1.15 : 1.75) * dpr;
+        if (!analog) {
+          ctx.shadowBlur = 7 * dpr;
+          ctx.shadowColor = n === sel ? 'rgba(255, 59, 107, 0.7)' : 'rgba(34, 197, 94, 0.7)';
+        }
+        this.strokeFaceSwivelArrows(
+          ctx,
+          q[0] * z + ox,
+          q[1] * z + oy,
+          (analog ? 6.0 : 9.0) * dpr,
+          (analog ? 2.8 : 4.0) * dpr,
+          (analog ? 2.3 : 3.2) * dpr,
+          ux,
+          uy,
+        );
+        ctx.restore();
+        continue;
+      }
       const isSwivel = n.id.startsWith('swivel');
       drawDot(
         q[0] * z + ox,
@@ -525,7 +587,7 @@ export class StageRenderer {
 
   private drawSelectedLimitArc(state: RenderContextState) {
     const { ctx, sel, by, z, ox, oy, dpr, constrainLimits, mode } = state;
-    if (!sel || (!constrainLimits && mode !== 'D')) return;
+    if (!sel || sel.id === 'lip' || sel.id === 'chinTip' || (!constrainLimits && mode !== 'D')) return;
     const [min, max] = sel.limits;
     if (min <= -179 && max >= 179) return;
     const p = pos(sel, by);
@@ -705,7 +767,7 @@ export class StageRenderer {
     ctx.stroke();
     ctx.restore();
 
-    // 6. Thinner HORIZON line
+    // 6. Thinner HORIZON line (+ tactile mechanical pitch grip near figure centerline when active)
     const hHot = hoverPersp === 'horizon' || draggingPersp === 'horizon';
     const [hxL, hyS] = toScreen(xMin, vy);
     const [hxR] = toScreen(xMax, vy);
@@ -720,6 +782,18 @@ export class StageRenderer {
     ctx.strokeStyle = hHot ? GREEN : 'rgba(192, 132, 252, 0.42)';
     ctx.lineWidth = (hHot ? 1.65 : 0.85) * dpr;
     ctx.stroke();
+
+    if (hHot) {
+      const [hcx] = toScreen(fx, vy);
+      ctx.beginPath();
+      ctx.moveTo(hcx - 12 * dpr, hyS - 3.5 * dpr);
+      ctx.lineTo(hcx + 12 * dpr, hyS - 3.5 * dpr);
+      ctx.moveTo(hcx - 12 * dpr, hyS + 3.5 * dpr);
+      ctx.lineTo(hcx + 12 * dpr, hyS + 3.5 * dpr);
+      ctx.strokeStyle = GREEN;
+      ctx.lineWidth = 1.35 * dpr;
+      ctx.stroke();
+    }
     ctx.restore();
 
     // 7. Single slideable perspective vanishing point on the horizon line
@@ -770,24 +844,31 @@ export class StageRenderer {
     const gctx = this.ghostBuf.getContext('2d') as CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null;
     if (!gctx) return;
 
-    // Save exact live angles, flipX, + root offsets before evaluating ghost poses
+    // Save exact live angles, flipX, skull view + root offsets before evaluating ghost poses
     const savedAng = nodes.map((n) => n.ang);
     const savedFlip = nodes.map((n) => !!n.flipX);
+    const savedHeadTurn = captureHeadTurnRenderSnapshot(by.head);
     const savedTx = root.tx;
     const savedTy = root.ty;
 
     const wingPop = state.wingPop ?? 0;
+    const liveBodyView: BodyTurnView = state.bodyView ?? 'front';
+    const ribAnchor: RibAnchorMode = state.ribAnchor ?? 'upper';
 
     for (const item of ghosts) {
+      const ghostView: BodyTurnView = item.pose.bodyView ?? 'front';
+      applyBodyViewPivots(nodes, by, ghostView, ribAnchor);
+      sortPiecesForBodyView(pieces, ghostView, wingPop > 0.05);
       for (const n of nodes) {
         if (n.id in item.pose.nodes) {
           n.ang = item.pose.nodes[n.id];
         }
         n.flipX = !!(item.pose.flipX && item.pose.flipX[n.id]);
       }
+      previewHeadTurnStepSync(by.head, resolvePoseHeadTurnStep(item.pose));
       root.tx = item.pose.root?.[0] ?? 0;
       root.ty = item.pose.root?.[1] ?? 0;
-      solveRig(nodes, by, state.bondOn ?? true, wingPop);
+      solveRig(nodes, by, state.bondOn ?? true, wingPop, ribAnchor);
 
       gctx.setTransform(1, 0, 0, 1, 0, 0);
       gctx.clearRect(0, 0, cv.width, cv.height);
@@ -840,14 +921,17 @@ export class StageRenderer {
       ctx.restore();
     }
 
-    // Restore live pose before painting active puppet
+    // Restore live view pivots, piece depth stack, pose & skull view before painting active puppet
+    applyBodyViewPivots(nodes, by, liveBodyView, ribAnchor);
+    sortPiecesForBodyView(pieces, liveBodyView, wingPop > 0.05);
     nodes.forEach((n, i) => {
       n.ang = savedAng[i];
       n.flipX = savedFlip[i];
     });
+    restoreHeadTurnRenderSnapshot(by.head, savedHeadTurn);
     root.tx = savedTx;
     root.ty = savedTy;
-    solveRig(nodes, by, state.bondOn ?? true, wingPop);
+    solveRig(nodes, by, state.bondOn ?? true, wingPop, ribAnchor);
   }
 
   private getPieceWorldAabb(p: RigPiece, wingPop: number): [number, number, number, number] | null {
@@ -1078,6 +1162,36 @@ export class StageRenderer {
       ctx.arc(q[0] * z + ox, q[1] * z + oy, 4 * dpr, 0, Math.PI * 2);
       ctx.fill();
     }
+
+    // 4. Core Triangle (Collarbone + Swivel + Spine) closed edge & elastic/mechanical buffer zone ring
+    if (spec.kind === 'shoulder') {
+      const ct = evalCoreTriangleState(spec.side, by, wingPop > 0.05);
+      const thNode = by.thorax;
+      const luNode = by.lumbar;
+      if (thNode && luNode) {
+        const pTh = pos(thNode, by);
+        const pLu = pos(luNode, by);
+        ctx.strokeStyle = ct.strained ? 'rgba(245, 158, 11, 0.85)' : 'rgba(168, 85, 247, 0.65)';
+        ctx.lineWidth = (ct.strained ? 2.1 : 1.4) * dpr;
+        ctx.beginPath();
+        ctx.moveTo(pLu[0] * z + ox, pLu[1] * z + oy);
+        ctx.lineTo(pTh[0] * z + ox, pTh[1] * z + oy);
+        ctx.stroke();
+      }
+      const bufR = (14.5 + ct.bufferFactor * 6.5) * dpr;
+      ctx.strokeStyle = ct.mode === 'elastic' ? 'rgba(192, 132, 252, 0.88)' : 'rgba(52, 211, 153, 0.78)';
+      ctx.lineWidth = 1.4 * dpr;
+      ctx.setLineDash([3.5 * dpr, 3 * dpr]);
+      for (const bId of ['swivel' + spec.side, 'brace' + spec.side, 'acromion' + spec.side]) {
+        const bn = by[bId];
+        if (!bn) continue;
+        const bp = pos(bn, by);
+        ctx.beginPath();
+        ctx.arc(bp[0] * z + ox, bp[1] * z + oy, bufR, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+      ctx.setLineDash([]);
+    }
     ctx.restore();
 
     return true;
@@ -1292,17 +1406,39 @@ export class StageRenderer {
 
       ctx.save();
       ctx.setTransform(1, 0, 0, 1, 0, 0);
-      if (isRedXRay) {
-        ctx.fillStyle = 'rgba(239, 68, 68, 0.16)';
+      const isFaceSwivel = hov.id === 'lip' || hov.id === 'chinTip';
+      if (isFaceSwivel) {
+        const [ux, uy] = this.getHeadAxis(by);
+        const halfSpan = 14 * dpr;
+        const barbLen = 5.5 * dpr;
+        const barbHalfH = 4.6 * dpr;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        if (isRedXRay) {
+          ctx.strokeStyle = 'rgba(239, 68, 68, 0.24)';
+          ctx.lineWidth = 6 * dpr;
+          this.strokeFaceSwivelArrows(ctx, clampedX, clampedY, halfSpan, barbLen, barbHalfH, ux, uy);
+        } else {
+          ctx.strokeStyle = 'rgba(14, 15, 17, 0.72)';
+          ctx.lineWidth = 4.2 * dpr;
+          this.strokeFaceSwivelArrows(ctx, clampedX, clampedY, halfSpan, barbLen, barbHalfH, ux, uy);
+        }
+        ctx.lineWidth = (isRedXRay ? 2.25 : 2.1) * dpr;
+        ctx.strokeStyle = isRedXRay ? RED : hov === sel ? MAGENTA : GREEN;
+        this.strokeFaceSwivelArrows(ctx, clampedX, clampedY, halfSpan, barbLen, barbHalfH, ux, uy);
+      } else {
+        if (isRedXRay) {
+          ctx.fillStyle = 'rgba(239, 68, 68, 0.16)';
+          ctx.beginPath();
+          ctx.arc(clampedX, clampedY, 12 * dpr, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        ctx.lineWidth = (isRedXRay ? 2.25 : 2) * dpr;
+        ctx.strokeStyle = isRedXRay ? RED : hov === sel ? MAGENTA : GREEN;
         ctx.beginPath();
         ctx.arc(clampedX, clampedY, 12 * dpr, 0, Math.PI * 2);
-        ctx.fill();
+        ctx.stroke();
       }
-      ctx.lineWidth = (isRedXRay ? 2.25 : 2) * dpr;
-      ctx.strokeStyle = isRedXRay ? RED : hov === sel ? MAGENTA : GREEN;
-      ctx.beginPath();
-      ctx.arc(clampedX, clampedY, 12 * dpr, 0, Math.PI * 2);
-      ctx.stroke();
 
       if (pivotOffscreen) {
         const ang = Math.atan2(sy - clampedY, sx - clampedX);
@@ -1412,7 +1548,30 @@ export class StageRenderer {
       if (!pt) continue;
       const sx = pt[0] * z + ox;
       const sy = pt[1] * z + oy;
-      const r = 6.5 * dpr;
+      const r = PIN_DIAMOND_RADIUS_PX * dpr;
+
+      // 1.25x joint-circle-radius magnetic capture halo around the pin diamond
+      const magR = (PIN_DIAMOND_RADIUS_PX + PIN_MAGNETIC_SNAP_RADIUS_PX) * dpr;
+      const targetInsideHalo =
+        ik.targetPos != null && distToPinDiamondPx(ik.targetPos, pt, z, dpr) <= PIN_MAGNETIC_SNAP_RADIUS_PX * dpr;
+      const hovInsideHalo =
+        hov != null && distToPinDiamondPx(pos(hov, by), pt, z, dpr) <= PIN_MAGNETIC_SNAP_RADIUS_PX * dpr;
+      const magHot = targetInsideHalo || hovInsideHalo;
+
+      ctx.save();
+      ctx.strokeStyle = magHot
+        ? 'rgba(52, 211, 153, 0.88)'
+        : pin?.pinned
+        ? 'rgba(245, 158, 11, 0.28)'
+        : 'rgba(16, 185, 129, 0.24)';
+      ctx.lineWidth = (magHot ? 1.65 : 1.0) * dpr;
+      ctx.setLineDash([3 * dpr, 3 * dpr]);
+      ctx.beginPath();
+      ctx.arc(sx, sy, magR, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.restore();
+
       ctx.fillStyle = pin?.pinned ? 'rgba(245, 158, 11, 0.85)' : 'rgba(16, 185, 129, 0.78)';
       ctx.strokeStyle = '#0e0f11';
       ctx.lineWidth = 1.5 * dpr;
@@ -1640,5 +1799,46 @@ export class StageRenderer {
     ctx.globalAlpha = useBlurredDigital ? 0.56 : 0.72;
     ctx.drawImage(this.collisionTextBuf, 0, 0, w, h);
     ctx.restore();
+  }
+
+  private getHeadAxis(by: Record<string, RigNode>): [number, number] {
+    const hd = by.head || by.neck;
+    if (!hd) return [1, 0];
+    const len = Math.hypot(hd.w[0], hd.w[1]);
+    if (!Number.isFinite(len) || len < 1e-4) return [1, 0];
+    return [hd.w[0] / len, hd.w[1] / len];
+  }
+
+  private strokeFaceSwivelArrows(
+    ctx: CanvasRenderingContext2D,
+    cx: number,
+    cy: number,
+    halfSpan: number,
+    barbLen: number,
+    barbHalfH: number,
+    ux: number,
+    uy: number,
+  ): void {
+    const nx = -uy;
+    const ny = ux;
+    const lx = cx - ux * halfSpan;
+    const ly = cy - uy * halfSpan;
+    const rx = cx + ux * halfSpan;
+    const ry = cy + uy * halfSpan;
+
+    ctx.beginPath();
+    ctx.moveTo(lx, ly);
+    ctx.lineTo(rx, ry);
+
+    // Left arrowhead (<)
+    ctx.moveTo(lx + ux * barbLen + nx * barbHalfH, ly + uy * barbLen + ny * barbHalfH);
+    ctx.lineTo(lx, ly);
+    ctx.lineTo(lx + ux * barbLen - nx * barbHalfH, ly + uy * barbLen - ny * barbHalfH);
+
+    // Right arrowhead (>)
+    ctx.moveTo(rx - ux * barbLen + nx * barbHalfH, ry - uy * barbLen + ny * barbHalfH);
+    ctx.lineTo(rx, ry);
+    ctx.lineTo(rx - ux * barbLen - nx * barbHalfH, ry - uy * barbLen - ny * barbHalfH);
+    ctx.stroke();
   }
 }

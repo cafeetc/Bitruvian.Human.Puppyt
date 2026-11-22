@@ -6,10 +6,9 @@
  *   pure black ink while keeping white teeth sharp.
  */
 import { mkCanvas, setPieceBitmap } from './fkEngine';
-import type { RigNode, RigPiece } from './types';
+import type { HeadTurnStep, RigNode, RigPiece, SkullViewMode } from './types';
 
-export type SkullViewMode = 'front' | 'side' | 'back';
-export type HeadTurnStep = 0 | 1 | 2 | 3;
+export type { SkullViewMode, HeadTurnStep };
 
 export interface HeadTurnSpec {
   step: HeadTurnStep;
@@ -85,6 +84,54 @@ export function setFrontSkullCache(
   frontBitmapCache = bm;
 }
 
+export function inferHeadTurnStepFromNode(headNode?: RigNode): HeadTurnStep {
+  if (!headNode) return 0;
+  const pieceName = headNode.pieces[0]?.name;
+  if (pieceName === 'Back' || headNode.name === 'Head (Back)') return 2;
+  if (pieceName === 'Side' || headNode.name.startsWith('Head (Side')) {
+    return headNode.flipX ? 3 : 1;
+  }
+  return headNode.flipX ? 3 : 0;
+}
+
+export function resolvePoseHeadTurnStep(pose?: {
+  headStep?: HeadTurnStep;
+  skullView?: SkullViewMode;
+  flipX?: Record<string, boolean>;
+}): HeadTurnStep {
+  if (!pose) return 0;
+  if (pose.headStep === 0 || pose.headStep === 1 || pose.headStep === 2 || pose.headStep === 3) {
+    return pose.headStep;
+  }
+  if (pose.skullView) {
+    return getHeadTurnStep(pose.skullView, !!pose.flipX?.head);
+  }
+  return pose.flipX?.head ? 3 : 0;
+}
+
+/**
+ * Computes the midpoint head-turn step between two keyframes along the 4-step 360° turntable.
+ * When keyframes are 180° apart (e.g., Front -> Back), synthesizes the intermediate Side view.
+ */
+export function midpointHeadTurnStep(stepA: HeadTurnStep, stepC: HeadTurnStep): HeadTurnStep {
+  if (stepA === stepC) return stepA;
+  const rawDelta = ((stepC - stepA) % 4 + 4) % 4;
+  if (rawDelta === 2) {
+    return (((stepA + 1) % 4) as HeadTurnStep);
+  }
+  return stepC;
+}
+
+export function preloadSkullAssets(): void {
+  if (typeof Image === 'undefined') return;
+  if (!skullCache.side && !skullLoadPromises.side) {
+    void loadNormalizedSkullAsset('side').catch(() => {});
+  }
+  if (!skullCache.back && !skullLoadPromises.back) {
+    void loadNormalizedSkullAsset('back').catch(() => {});
+  }
+}
+
 /**
  * Crops the real PNG skull sprite to its tight silhouette bounds and harmonizes
  * the primary #6e05f1 purple fill to Bitruvius's exact body purple (#5d03b4)
@@ -96,6 +143,10 @@ function loadNormalizedSkullAsset(mode: 'side' | 'back'): Promise<BitmapCanvas> 
 
   const spec = SKULL_SPECS[mode];
   const promise = new Promise<BitmapCanvas>((resolve, reject) => {
+    if (typeof Image === 'undefined') {
+      reject(new Error('Image unavailable'));
+      return;
+    }
     const img = new Image();
     img.crossOrigin = 'anonymous';
     img.onload = () => {
@@ -214,8 +265,16 @@ export function applySkullView(
   }
 
   if (mode === 'front') {
+    const alreadyFront =
+      hp.name === 'Front' &&
+      hp.x === hp.restBox.x &&
+      hp.y === hp.restBox.y &&
+      hp.w === hp.restBox.w &&
+      hp.h === hp.restBox.h &&
+      (!frontBitmapCache || hp.bm === frontBitmapCache);
     hp.name = 'Front';
     headNode.name = 'Head (Front)';
+    if (alreadyFront) return;
     applyBox(hp, hp.restBox);
     if (frontBitmapCache) {
       setPieceBitmap(hp, frontBitmapCache, onWake);
@@ -227,20 +286,33 @@ export function applySkullView(
 
   const spec = SKULL_SPECS[mode];
   const headOffsetY = hp.restBox.y - 18;
-  hp.name = mode === 'side' ? 'Side' : 'Back';
-  headNode.name = mode === 'side' ? (headNode.flipX ? 'Head (Side L)' : 'Head (Side R)') : 'Head (Back)';
+  const targetPieceName = mode === 'side' ? 'Side' : 'Back';
+  const targetNodeName = mode === 'side' ? (headNode.flipX ? 'Head (Side L)' : 'Head (Side R)') : 'Head (Back)';
+  const targetBox = { x: spec.dx, y: spec.dy + headOffsetY, w: spec.w, h: spec.h };
 
   const cached = skullCache[mode];
   if (cached) {
-    applyBox(hp, { x: spec.dx, y: spec.dy + headOffsetY, w: spec.w, h: spec.h });
+    const alreadyCached =
+      hp.name === targetPieceName &&
+      hp.bm === cached &&
+      hp.x === targetBox.x &&
+      hp.y === targetBox.y &&
+      hp.w === targetBox.w &&
+      hp.h === targetBox.h;
+    hp.name = targetPieceName;
+    headNode.name = targetNodeName;
+    if (alreadyCached) return;
+    applyBox(hp, targetBox);
     setPieceBitmap(hp, cached, onWake);
     return;
   }
 
+  hp.name = targetPieceName;
+  headNode.name = targetNodeName;
   loadNormalizedSkullAsset(mode)
     .then((canvas) => {
       if (activeRequestedMode !== mode) return;
-      applyBox(hp, { x: spec.dx, y: spec.dy + headOffsetY, w: spec.w, h: spec.h });
+      applyBox(hp, targetBox);
       setPieceBitmap(hp, canvas, onWake);
     })
     .catch(() => {
@@ -261,4 +333,74 @@ export function applyHeadTurnStep(
   headNode.flipX = spec.flipX;
   applySkullView(headNode, spec.view, onWake);
   return spec;
+}
+
+export interface HeadTurnRenderSnapshot {
+  nodeName: string;
+  flipX: boolean;
+  pieceName: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  bm: CanvasImageSource | undefined;
+}
+
+export function captureHeadTurnRenderSnapshot(headNode?: RigNode): HeadTurnRenderSnapshot | null {
+  if (!headNode || !headNode.pieces.length) return null;
+  const hp = headNode.pieces[0];
+  return {
+    nodeName: headNode.name,
+    flipX: !!headNode.flipX,
+    pieceName: hp.name,
+    x: hp.x,
+    y: hp.y,
+    w: hp.w,
+    h: hp.h,
+    bm: hp.bm,
+  };
+}
+
+export function previewHeadTurnStepSync(headNode: RigNode | undefined, step: HeadTurnStep): void {
+  if (!headNode || !headNode.pieces.length) return;
+  const hp = headNode.pieces[0];
+  if (!hp.restBox) hp.restBox = { x: hp.x, y: hp.y, w: hp.w, h: hp.h };
+  const spec = HEAD_TURN_SEQUENCE[((step % 4) + 4) % 4];
+  headNode.flipX = spec.flipX;
+
+  if (spec.view === 'front') {
+    hp.name = 'Front';
+    headNode.name = 'Head (Front)';
+    applyBox(hp, hp.restBox);
+    if (frontBitmapCache) hp.bm = frontBitmapCache;
+    return;
+  }
+
+  const cached = skullCache[spec.view];
+  if (!cached) {
+    preloadSkullAssets();
+    return;
+  }
+  const s = SKULL_SPECS[spec.view];
+  const headOffsetY = hp.restBox.y - 18;
+  hp.name = spec.view === 'side' ? 'Side' : 'Back';
+  headNode.name = spec.view === 'side' ? (headNode.flipX ? 'Head (Side L)' : 'Head (Side R)') : 'Head (Back)';
+  applyBox(hp, { x: s.dx, y: s.dy + headOffsetY, w: s.w, h: s.h });
+  hp.bm = cached;
+}
+
+export function restoreHeadTurnRenderSnapshot(
+  headNode: RigNode | undefined,
+  snap: HeadTurnRenderSnapshot | null,
+): void {
+  if (!headNode || !headNode.pieces.length || !snap) return;
+  const hp = headNode.pieces[0];
+  headNode.name = snap.nodeName;
+  headNode.flipX = snap.flipX;
+  hp.name = snap.pieceName;
+  hp.x = snap.x;
+  hp.y = snap.y;
+  hp.w = snap.w;
+  hp.h = snap.h;
+  if (snap.bm !== undefined) hp.bm = snap.bm;
 }

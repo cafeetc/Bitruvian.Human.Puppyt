@@ -12,8 +12,16 @@
  *   zooming, and popup room splits so Bitruvius can never leave the visible canvas.
  */
 import { cloneGotzState } from './gotzHandEngine';
+import {
+  CANONICAL_PROPORTIONS,
+  VECTOR_EPSILON_PX,
+  safeFinite,
+  snapAngularEpsilon,
+} from './jointLimits';
 import { ANATOMICAL_LIMITS, EFFECTOR_ROLES, LIMB_CHAINS } from './rigMetadata';
+import { auditRigHierarchy, getCanonicalBoneLabel, sortNodesTopologically, type HierarchyAuditReport } from './rigRoles';
 import type {
+  BodyTurnView,
   BondStatusItem,
   CameraBox,
   Keyframe,
@@ -23,6 +31,9 @@ import type {
   RigNode,
   RigPiece,
 } from './types';
+
+export { CANONICAL_PROPORTIONS, auditRigHierarchy };
+export type { HierarchyAuditReport };
 
 export const DEG = Math.PI / 180;
 const IDENTITY = [1, 0, 0, 1, 0, 0];
@@ -493,54 +504,195 @@ export function parentOf(n: RigNode, by: Record<string, RigNode>): RigNode | nul
 export function pos(n: RigNode, by: Record<string, RigNode>, out: [number, number] = [0, 0]): [number, number] {
   const par = parentOf(n, by);
   const w = par ? par.w : IDENTITY;
-  const x = n.piv[0] + (n.parent ? 0 : n.tx);
-  const y = n.piv[1] + (n.parent ? 0 : n.ty);
-  out[0] = w[0] * x + w[2] * y + w[4];
-  out[1] = w[1] * x + w[3] * y + w[5];
+  const tx = safeFinite(n.tx, 0);
+  const ty = safeFinite(n.ty, 0);
+  const x = safeFinite(n.piv[0], 0) + (n.parent ? 0 : tx);
+  const y = safeFinite(n.piv[1], 0) + (n.parent ? 0 : ty);
+  out[0] = safeFinite(w[0] * x + w[2] * y + w[4], x);
+  out[1] = safeFinite(w[1] * x + w[3] * y + w[5], y);
   return out;
 }
 
 export function setW(n: RigNode, rad: number, by: Record<string, RigNode>): void {
   const par = parentOf(n, by);
   const p = par ? par.w : IDENTITY;
-  const c = Math.cos(rad);
-  const s = Math.sin(rad);
+  const safeRad = safeFinite(rad, 0);
+  const c = Math.cos(safeRad);
+  const s = Math.sin(safeRad);
   const fx = n.flipX ? -1 : 1;
-  const px = n.piv[0];
-  const py = n.piv[1];
-  const e = px - fx * c * px + s * py + n.tx;
-  const f = py - fx * s * px - c * py + n.ty;
+  const px = safeFinite(n.piv[0], 0);
+  const py = safeFinite(n.piv[1], 0);
+  const tx = safeFinite(n.tx, 0);
+  const ty = safeFinite(n.ty, 0);
+  const e = px - fx * c * px + s * py + tx;
+  const f = py - fx * s * px - c * py + ty;
   const m00 = fx * c;
   const m01 = -s;
   const m10 = fx * s;
   const m11 = c;
   const w = n.w;
-  w[0] = p[0] * m00 + p[2] * m10;
-  w[1] = p[1] * m00 + p[3] * m10;
-  w[2] = p[0] * m01 + p[2] * m11;
-  w[3] = p[1] * m01 + p[3] * m11;
-  w[4] = p[0] * e + p[2] * f + p[4];
-  w[5] = p[1] * e + p[3] * f + p[5];
+  w[0] = safeFinite(p[0] * m00 + p[2] * m10, 1);
+  w[1] = safeFinite(p[1] * m00 + p[3] * m10, 0);
+  w[2] = safeFinite(p[0] * m01 + p[2] * m11, 0);
+  w[3] = safeFinite(p[1] * m01 + p[3] * m11, 1);
+  w[4] = safeFinite(p[0] * e + p[2] * f + p[4], px);
+  w[5] = safeFinite(p[1] * e + p[3] * f + p[5], py);
 }
 
 export function normalizeDeg(deg: number): number {
-  return ((((deg + 180) % 360) + 360) % 360) - 180;
+  const safe = safeFinite(deg, 0);
+  return snapAngularEpsilon(((((safe + 180) % 360) + 360) % 360) - 180);
 }
 
 export function toPure360(deg: number): number {
-  return ((Math.round(deg) % 360) + 360) % 360;
+  return ((Math.round(safeFinite(deg, 0)) % 360) + 360) % 360;
 }
 
 export function clampAnatomicalAngle(n: RigNode, deg: number, constrainLimits: boolean): number {
   const norm = normalizeDeg(deg);
   if (!constrainLimits) return norm;
   const [min, max] = n.limits;
-  return Math.max(min, Math.min(max, norm));
+  return snapAngularEpsilon(Math.max(min, Math.min(max, norm)));
+}
+
+export const CORE_TRIANGLE_NODE_IDS = new Set([
+  'lumbar',
+  'thorax',
+  'neck',
+  'swivelL',
+  'swivelR',
+  'braceL',
+  'braceR',
+  'acromionL',
+  'acromionR',
+]);
+
+export function isCoreTriangleNode(id: string): boolean {
+  return CORE_TRIANGLE_NODE_IDS.has(id);
+}
+
+export interface CoreTriangleState {
+  side: 'L' | 'R';
+  mode: 'elastic' | 'mechanical';
+  strained: boolean;
+  /** 0 = inside unbroken core triangle, 0..1 = easing through buffer zone, 1 = full break threshold */
+  bufferFactor: number;
+  broken: boolean;
+  stretchRatio: number;
+}
+
+/**
+ * Evaluates the Core Triangle (Spine thorax/lumbar -> Collarbone brace -> Swivel -> Shoulder Socket acromion)
+ * so UI overlays and solvers know when a joint is easing inside the elastic/mechanical buffer zone.
+ */
+export function evalCoreTriangleState(
+  side: 'L' | 'R',
+  by: Record<string, RigNode>,
+  prometheusWings = false,
+): CoreTriangleState {
+  const mode: 'elastic' | 'mechanical' = prometheusWings ? 'elastic' : 'mechanical';
+  const sw = by['swivel' + side];
+  const br = by['brace' + side];
+  const ac = by['acromion' + side];
+  const th = by.thorax;
+  const lu = by.lumbar;
+  if (!sw || !br || !ac) {
+    return { side, mode, strained: false, bufferFactor: 0, broken: false, stretchRatio: 0 };
+  }
+
+  const thAng = th ? th.ang : 0;
+  const luAng = lu ? lu.ang : 0;
+  const swRel = Math.abs(normalizeDeg(sw.ang - thAng));
+  const brAng = Math.abs(normalizeDeg(br.ang));
+  const acAng = Math.abs(normalizeDeg(ac.ang));
+  const spRel = Math.max(Math.abs(normalizeDeg(thAng)), Math.abs(normalizeDeg(luAng)));
+
+  let stretchRatio = 0;
+  if (br.aim && (br.w[0] || br.w[1]) && (ac.w[0] || ac.w[1])) {
+    const bp = pos(br, by);
+    const ap = pos(ac, by);
+    const L0 = Math.max(VECTOR_EPSILON_PX, Math.hypot(br.aim.from[0] - br.piv[0], br.aim.from[1] - br.piv[1]));
+    const d = Math.hypot(ap[0] - bp[0], ap[1] - bp[1]);
+    stretchRatio = Math.max(0, Math.abs(d - L0) / (L0 * (prometheusWings ? 0.28 : 0.14)));
+  }
+
+  const swZone = Math.max(0, (swRel - 16) / (prometheusWings ? 26 : 12));
+  const brZone = Math.max(0, (brAng - 8) / (prometheusWings ? 18 : 6));
+  const acZone = Math.max(0, (acAng - 22) / (prometheusWings ? 34 : 14));
+  const spZone = Math.max(0, (spRel - 44) / 32);
+  const bondDelta = sw.bond ? Math.abs(normalizeDeg(sw.eff - sw.ang)) / (prometheusWings ? 14 : 6) : 0;
+
+  const raw = Math.max(swZone, brZone, acZone, spZone, stretchRatio, bondDelta);
+  const bufferFactor = Math.max(0, Math.min(1, raw));
+  return {
+    side,
+    mode,
+    strained: bufferFactor > 0.04,
+    bufferFactor,
+    broken: bufferFactor >= 0.96,
+    stretchRatio,
+  };
+}
+
+/**
+ * Simulates an elastic (Prometheus) or mechanical detent buffer zone around Core Triangle joints
+ * (`Collarbone`, `Swivel`, `Shoulder Socket`, `Spine`) so displacements ease in and ease out
+ * smoothly instead of breaking or hard-snapping the core triangle.
+ */
+export function applyCoreTriangleBufferEasing(
+  n: RigNode,
+  rawDeg: number,
+  by: Record<string, RigNode>,
+  prometheusWings: boolean,
+): number {
+  const norm = normalizeDeg(rawDeg);
+  const thAng = by.thorax ? safeFinite(by.thorax.ang, 0) : 0;
+
+  let refAng = 0;
+  let coreSafe = 180;
+  let bufferHeadroom = 0;
+
+  if (n.id === 'swivelL' || n.id === 'swivelR') {
+    refAng = thAng;
+    coreSafe = 16;
+    bufferHeadroom = prometheusWings ? 26 : 12;
+  } else if (n.id === 'braceL' || n.id === 'braceR') {
+    coreSafe = 8;
+    bufferHeadroom = prometheusWings ? 28 : 6;
+  } else if (n.id === 'acromionL' || n.id === 'acromionR') {
+    coreSafe = 22;
+    bufferHeadroom = prometheusWings ? 38 : 13;
+  } else if (n.id === 'lumbar') {
+    coreSafe = 48;
+    bufferHeadroom = 34;
+  } else if (n.id === 'thorax') {
+    coreSafe = 44;
+    bufferHeadroom = 32;
+  } else {
+    return norm;
+  }
+
+  const rel = normalizeDeg(norm - refAng);
+  const absRel = Math.abs(rel);
+  if (absRel <= coreSafe || bufferHeadroom <= 0.1) {
+    return norm;
+  }
+
+  const sign = rel >= 0 ? 1 : -1;
+  const excess = absRel - coreSafe;
+  // Ease-in/ease-out mechanical detent or elastic buffer curve around the boundary
+  const u = Math.min(1, excess / bufferHeadroom);
+  const hermite = u * u * (3 - 2 * u);
+  const damped = prometheusWings
+    ? bufferHeadroom * Math.tanh(excess / (bufferHeadroom * 0.95))
+    : bufferHeadroom * (0.68 * Math.tanh(excess / bufferHeadroom) + 0.32 * hermite * (excess / Math.max(excess, bufferHeadroom)));
+  return normalizeDeg(refAng + sign * (coreSafe + Math.min(bufferHeadroom, damped)));
 }
 
 /**
  * Enforces realistic shoulder-girdle constraints when Prometheus wing mode is OFF
- * so back shoulders stay tucked at the paddle/shoulderbone/swivel/spine junction.
+ * so back shoulders stay tucked at the paddle/shoulderbone/swivel/spine junction,
+ * while routing past core bounds smoothly through the Core Triangle buffer zone.
  */
 export function clampRealisticShoulder(
   n: RigNode,
@@ -548,20 +700,20 @@ export function clampRealisticShoulder(
   by: Record<string, RigNode>,
   prometheusWings: boolean,
 ): number {
-  const norm = normalizeDeg(deg);
-  if (prometheusWings) return norm;
+  const buffered = applyCoreTriangleBufferEasing(n, deg, by, prometheusWings);
+  if (prometheusWings) return buffered;
   if (n.id === 'braceL' || n.id === 'braceR') {
-    return Math.max(-12, Math.min(12, norm));
+    return Math.max(-12, Math.min(12, buffered));
   }
   if (n.id === 'swivelL' || n.id === 'swivelR') {
     const txAng = by.thorax ? by.thorax.ang : 0;
-    const rel = Math.max(-28, Math.min(28, normalizeDeg(norm - txAng)));
+    const rel = Math.max(-28, Math.min(28, normalizeDeg(buffered - txAng)));
     return normalizeDeg(txAng + rel);
   }
   if (n.id === 'acromionL' || n.id === 'acromionR') {
-    return Math.max(-35, Math.min(35, norm));
+    return Math.max(-35, Math.min(35, buffered));
   }
-  return norm;
+  return buffered;
 }
 
 export function getTensionRatio(n: RigNode): { ratio: number; nearLimit: boolean; atLimit: boolean } {
@@ -605,8 +757,8 @@ export function setWorldDir(
 }
 
 /**
- * Closed-chain shoulder bond: keeps navel -> swivel -> acromion -> tendon/paddle -> neck closed
- * while preserving anatomical left/right chirality so shoulders never flip cross-body.
+ * Closed-chain shoulder bond: keeps navel -> swivel -> acromion -> collarbone -> neck closed
+ * with a Core Triangle elastic/mechanical buffer zone and left/right chirality preservation.
  */
 export function bondAng(
   n: RigNode,
@@ -615,16 +767,16 @@ export function bondAng(
   prometheusWings = false,
 ): number {
   const b = n.bond;
-  if (!b || !bondOn || !b.aim) return n.ang;
+  if (!b || !bondOn || !b.aim) return safeFinite(n.ang, 0);
   const ac = by[b.aim.to];
-  if (!ac || !n.parent || !b.parent) return n.ang;
+  if (!ac || !n.parent || !b.parent || !by[n.parent] || !by[b.parent]) return safeFinite(n.ang, 0);
   const lw = by[n.parent].w;
   const tw = by[b.parent].w;
   const bp = b.piv;
   const nx = tw[0] * bp[0] + tw[2] * bp[1] + tw[4];
   const ny = tw[1] * bp[0] + tw[3] * bp[1] + tw[5];
   const f = b.aim.from;
-  const L0 = Math.hypot(f[0] - bp[0], f[1] - bp[1]);
+  const L0 = Math.max(VECTOR_EPSILON_PX, Math.hypot(f[0] - bp[0], f[1] - bp[1]));
   const lo = b.aim.min * L0;
   const hi = b.aim.max * L0;
   const px = n.piv[0];
@@ -632,10 +784,10 @@ export function bondAng(
   const ax = ac.piv[0] - px;
   const ay = ac.piv[1] - py;
   const sideSign = n.id.endsWith('L') ? 1 : -1;
-  const txAng = by[b.parent] ? by[b.parent].ang : 0;
+  const txAng = safeFinite(by[b.parent] ? by[b.parent].ang : 0, 0);
 
   const v = (a: number) => {
-    const r = a * DEG;
+    const r = safeFinite(a, 0) * DEG;
     const c = Math.cos(r);
     const s = Math.sin(r);
     const X = px + c * ax - s * ay;
@@ -643,10 +795,13 @@ export function bondAng(
     const wx = lw[0] * X + lw[2] * Y + lw[4];
     const wy = lw[1] * X + lw[3] * Y + lw[5];
     const d = Math.hypot(wx - nx, wy - ny);
+    // Elastic/mechanical buffer envelope around normal collarbone reach
     const stretchTol = prometheusWings ? 1.28 : 1.12;
     const loSoft = lo * (prometheusWings ? 0.8 : 0.92);
     const hiSoft = hi * stretchTol;
-    const distErr = d < loSoft ? loSoft - d : d > hiSoft ? d - hiSoft : 0;
+    const rawDistErr = d < loSoft ? loSoft - d : d > hiSoft ? d - hiSoft : 0;
+    const bufScale = L0 * 0.08;
+    const distErr = rawDistErr > 0 ? rawDistErr + (bufScale * (rawDistErr / (rawDistErr + bufScale))) * 0.35 : 0;
     const lateralSigned = ((wx - nx) * tw[0] + (wy - ny) * tw[1]) * sideSign;
     const minLat = prometheusWings ? 32 : 240;
     const latErr = lateralSigned < minLat ? (minLat - lateralSigned) * 4 : 0;
@@ -657,11 +812,12 @@ export function bondAng(
   };
 
   // Seed search inside realistic shoulder range around thorax if current angle is cross-body/out of bounds
+  const curAng = safeFinite(n.ang, 0);
   const seed = prometheusWings
-    ? n.ang
-    : normalizeDeg(txAng + Math.max(-28, Math.min(28, normalizeDeg(n.ang - txAng))));
+    ? curAng
+    : normalizeDeg(txAng + Math.max(-28, Math.min(28, normalizeDeg(curAng - txAng))));
 
-  if (v(seed) === 0) return seed;
+  if (v(seed) === 0) return snapAngularEpsilon(seed);
   for (let i = 1; i <= 720; i++) {
     for (const s of [1, -1]) {
       const a = seed + s * i * 0.5;
@@ -673,7 +829,7 @@ export function bondAng(
           if (v(m) === 0) good = m;
           else bad = m;
         }
-        return good;
+        return snapAngularEpsilon(good);
       }
     }
   }
@@ -687,16 +843,16 @@ export function bondAng(
       best = a;
     }
   }
-  return best;
+  return snapAngularEpsilon(best);
 }
 
 export function setAim(n: RigNode, by: Record<string, RigNode>, bondOn: boolean, prometheusWings = false): void {
-  if (!n.aim || !n.parent) return;
+  if (!n.aim || !n.parent || !by[n.parent]) return;
   const pw = by[n.parent].w;
   const p = n.piv;
   const F = n.aim.from;
   const ac = by[n.aim.to];
-  if (!ac || !ac.parent) return;
+  if (!ac || !ac.parent || !by[ac.parent]) return;
   const aw = by[ac.parent].w;
   const Qx = aw[0] * ac.piv[0] + aw[2] * ac.piv[1] + aw[4];
   const Qy = aw[1] * ac.piv[0] + aw[3] * ac.piv[1] + aw[5];
@@ -705,22 +861,28 @@ export function setAim(n: RigNode, by: Record<string, RigNode>, bondOn: boolean,
   const vx = Qx - X;
   const vy = Qy - Y;
   const rawDist = Math.hypot(vx, vy);
-  // Procedural singularity guard if target collapses onto pivot
-  const dist = rawDist > 1e-3 ? rawDist : 1;
-  const L0 = Math.hypot(F[0] - p[0], F[1] - p[1]) || 1;
+  // Deterministic singularity guard if target collapses onto pivot or degenerate vector
+  const hasDir = Number.isFinite(rawDist) && rawDist > VECTOR_EPSILON_PX;
+  const dist = hasDir ? rawDist : 1;
+  const refDx = F[0] - p[0];
+  const refDy = F[1] - p[1];
+  const L0 = Math.hypot(refDx, refDy) > VECTOR_EPSILON_PX ? Math.hypot(refDx, refDy) : 1;
+  const refAng = Math.hypot(refDx, refDy) > VECTOR_EPSILON_PX ? Math.atan2(refDy, refDx) : 0;
   const maxTilt = prometheusWings ? 62 : 14;
   const clampedAng = Math.max(-maxTilt, Math.min(maxTilt, normalizeDeg(n.ang)));
-  const dirX = rawDist > 1e-3 ? vx / dist : Math.cos(Math.atan2(pw[1], pw[0]));
-  const dirY = rawDist > 1e-3 ? vy / dist : Math.sin(Math.atan2(pw[1], pw[0]));
-  let a = Math.atan2(dirY, dirX) - Math.atan2(F[1] - p[1], F[0] - p[0]) + clampedAng * DEG;
+  const parentAng = Math.atan2(pw[1], pw[0]);
+  const dirX = hasDir ? vx / dist : Math.cos(parentAng);
+  const dirY = hasDir ? vy / dist : Math.sin(parentAng);
+  let a = Math.atan2(dirY, dirX) - refAng + clampedAng * DEG;
   if (!prometheusWings) {
-    const thoraxRad = Math.atan2(pw[1], pw[0]);
-    const relRad = Math.atan2(Math.sin(a - thoraxRad), Math.cos(a - thoraxRad));
+    const relRad = Math.atan2(Math.sin(a - parentAng), Math.cos(a - parentAng));
     const maxSwing = 24 * DEG;
-    a = thoraxRad + Math.max(-maxSwing, Math.min(maxSwing, relRad));
+    a = parentAng + Math.max(-maxSwing, Math.min(maxSwing, relRad));
   }
-  const delta = dist - L0;
-  const rawSlide = delta * (prometheusWings ? 0.78 : 0.5);
+  const delta = (hasDir ? rawDist : L0) - L0;
+  // Scale elastic stretch smoothly using Leonardo shoulder-to-forearm proportional ratio (1/8 / 1/5 = 0.625)
+  const armSegRatio = CANONICAL_PROPORTIONS.leonardo.upperArmToHeight / CANONICAL_PROPORTIONS.leonardo.forearmHandToHeight;
+  const rawSlide = delta * (prometheusWings ? Math.min(0.82, 0.5 + armSegRatio * 0.448) : 0.5);
   const [minS, maxS] = bondOn
     ? prometheusWings
       ? [-0.52 * L0, 0.36 * L0]
@@ -728,23 +890,25 @@ export function setAim(n: RigNode, by: Record<string, RigNode>, bondOn: boolean,
     : prometheusWings
       ? [-0.26 * L0, 0.22 * L0]
       : [-0.14 * L0, 0.08 * L0];
-  // Smooth elastic knee easing when stretching near shoulder bond limits
+  // Smooth C1 ease-in/ease-out elastic/mechanical buffer zone around the joint
   const span = Math.max(1, (maxS - minS) * 0.5);
   const mid = (minS + maxS) * 0.5;
-  const slide = mid + span * Math.tanh((rawSlide - mid) / span);
-  // Subtle procedural micro-scale cushion (more elastic give in Prometheus mode)
+  const normDelta = (rawSlide - mid) / span;
+  const absN = Math.min(1.5, Math.abs(normDelta));
+  const easeCurve = absN <= 0.65 ? normDelta : Math.sign(normDelta) * (0.65 + (span > 1 ? 0.35 * Math.tanh((absN - 0.65) * 1.45) : 0));
+  const slide = mid + span * easeCurve;
   const stretchRatio = (delta - slide) / L0;
   const scaleCap = prometheusWings ? 0.028 : 0.014;
   const microScale = 1 + Math.max(-scaleCap, Math.min(scaleCap, stretchRatio * (prometheusWings ? 0.08 : 0.06)));
-  const c = Math.cos(a) * microScale;
-  const s = Math.sin(a) * microScale;
+  const c = safeFinite(Math.cos(a) * microScale, 1);
+  const s = safeFinite(Math.sin(a) * microScale, 0);
   const w = n.w;
   w[0] = c;
   w[1] = s;
   w[2] = -s;
   w[3] = c;
-  w[4] = X + dirX * slide - (c * p[0] - s * p[1]);
-  w[5] = Y + dirY * slide - (s * p[0] + c * p[1]);
+  w[4] = safeFinite(X + dirX * slide - (c * p[0] - s * p[1]), p[0]);
+  w[5] = safeFinite(Y + dirY * slide - (s * p[0] + c * p[1]), p[1]);
 }
 
 export interface PrometheusShoulderDragBaseline {
@@ -792,6 +956,13 @@ export function applyPrometheusArmCompensation(
     constrainLimits,
   );
 
+  const upperArm = CANONICAL_PROPORTIONS.leonardo.upperArmToHeight;
+  const forearmHand = CANONICAL_PROPORTIONS.leonardo.forearmHandToHeight;
+  const handFrac = CANONICAL_PROPORTIONS.vitruvius.handToHeight;
+  // Distal attenuation ratios grounded in Leonardo's arm-division proportions (elbow->wrist+hand vs shoulder->elbow)
+  const forearmAtten = (upperArm / (forearmHand + upperArm)) * 1.1; // ~0.42
+  const handAtten = (handFrac / forearmHand) * 0.56; // ~0.28
+
   if (humerus) {
     humerus.ang = clampAnatomicalAngle(
       humerus,
@@ -802,14 +973,14 @@ export function applyPrometheusArmCompensation(
   if (forearm) {
     forearm.ang = clampAnatomicalAngle(
       forearm,
-      base.forearm0 + dBrace * 0.42,
+      base.forearm0 + dBrace * forearmAtten,
       constrainLimits,
     );
   }
   if (hand) {
     hand.ang = clampAnatomicalAngle(
       hand,
-      base.hand0 - dBrace * 0.28,
+      base.hand0 - dBrace * handAtten,
       constrainLimits,
     );
   }
@@ -835,6 +1006,23 @@ export function applyPrometheusWingFollowFromArm(
   }
 }
 
+function hasTopologicalOrder(nodes: RigNode[]): boolean {
+  const idxMap = new Map<string, number>();
+  for (let i = 0; i < nodes.length; i++) idxMap.set(nodes[i].id, i);
+  for (let i = 0; i < nodes.length; i++) {
+    const n = nodes[i];
+    if (n.parent) {
+      const pIdx = idxMap.get(n.parent);
+      if (pIdx !== undefined && pIdx >= i) return false;
+    }
+    if (n.aim?.to) {
+      const tIdx = idxMap.get(n.aim.to);
+      if (tIdx !== undefined && tIdx >= i) return false;
+    }
+  }
+  return true;
+}
+
 export function solveRig(
   nodes: RigNode[],
   by: Record<string, RigNode>,
@@ -842,29 +1030,33 @@ export function solveRig(
   wingPop = 0,
   ribAnchor: RibAnchorMode = 'upper',
 ): void {
-  const activeWings = wingPop > 0.05;
-  for (const n of nodes) {
-    // Self-corrective finite guard against NaN/Infinity propagation
-    if (!Number.isFinite(n.ang)) n.ang = 0;
-    if (!Number.isFinite(n.tx)) n.tx = 0;
-    if (!Number.isFinite(n.ty)) n.ty = 0;
+  const safeWingPop = safeFinite(wingPop, 0);
+  const activeWings = safeWingPop > 0.05;
+  // Guarantee strict parent-before-child topological evaluation order
+  const evalOrder = hasTopologicalOrder(nodes) ? nodes : sortNodesTopologically(nodes, by);
+
+  for (const n of evalOrder) {
+    // Self-corrective deterministic guards against NaN/Infinity propagation
+    n.ang = snapAngularEpsilon(n.ang);
+    n.tx = safeFinite(n.tx, 0);
+    n.ty = safeFinite(n.ty, 0);
     if (!Number.isFinite(n.piv[0]) || !Number.isFinite(n.piv[1])) {
       n.piv = n.rest.slice() as [number, number];
     }
 
     if (n.id === 'wingL' || n.id === 'wingR') {
       n.ghost = !activeWings;
-      if (wingPop > 0.001 && n.parent && by[n.parent]) {
+      if (safeWingPop > 0.001 && n.parent && by[n.parent]) {
         const br = by[n.parent];
         const side = n.id === 'wingL' ? 1 : -1;
-        const flareRad = side * -32 * wingPop * DEG;
+        const flareRad = side * -32 * safeWingPop * DEG;
         const c = Math.cos(flareRad);
         const s = Math.sin(flareRad);
         const dx = n.rest[0] - br.piv[0];
         const dy = n.rest[1] - br.piv[1];
         n.piv = [
-          br.piv[0] + c * dx - s * dy + side * 42 * wingPop,
-          br.piv[1] + s * dx + c * dy - 26 * wingPop,
+          br.piv[0] + c * dx - s * dy + side * 42 * safeWingPop,
+          br.piv[1] + s * dx + c * dy - 26 * safeWingPop,
         ];
       } else {
         n.piv = n.rest.slice() as [number, number];
@@ -880,7 +1072,7 @@ export function solveRig(
         solvedAng = clampChungusRibAngle(n.id, solvedAng, 'lower', by, activeWings);
         n.ang = solvedAng;
       }
-      n.eff = Number.isFinite(solvedAng) ? solvedAng : 0;
+      n.eff = snapAngularEpsilon(solvedAng);
       setW(n, n.eff * DEG, by);
     }
   }
@@ -975,12 +1167,13 @@ export function buildRigGraph(rawInput: RawRigDef, includeDigitsAndJoints = true
 
   let nodes: RigNode[] = def.nodes.map((n) => ({
     id: n.id,
-    name: n.name || n.id,
+    name: getCanonicalBoneLabel(n.id, n.name || n.id),
     parent: n.parent || null,
     aim: n.aim || null,
     pieces: (n.pieces || []) as RigPiece[],
     piv: n.pivot.slice() as [number, number],
     rest: n.pivot.slice() as [number, number],
+    baseRest: n.pivot.slice() as [number, number],
     ang: n.ang || 0,
     tx: 0,
     ty: 0,
@@ -1010,26 +1203,12 @@ export function buildRigGraph(rawInput: RawRigDef, includeDigitsAndJoints = true
     }
   });
 
-  const ord: RigNode[] = [];
-  const seen = new Set<string>();
-  const dep = (n: RigNode) => {
-    const d: Array<string | null> = [n.parent];
-    if (n.aim) d.push(n.aim.to);
-    return d;
-  };
-  const vis = (n: RigNode) => {
-    if (seen.has(n.id)) return;
-    seen.add(n.id);
-    for (const d of dep(n)) {
-      if (d && by[d]) vis(by[d]);
-    }
-    if (n.bond && n.bond.parent && by[n.bond.parent]) {
-      vis(by[n.bond.parent]);
-    }
-    ord.push(n);
-  };
-  nodes.forEach(vis);
-  nodes = ord;
+  nodes = sortNodesTopologically(nodes, by);
+  const hierarchyAudit = auditRigHierarchy(nodes, by);
+  if (!hierarchyAudit.valid) {
+    // Re-run topological sort cleanly if any auxiliary node needed settling
+    nodes = sortNodesTopologically(nodes, by);
+  }
 
   assetTips(nodes);
 
@@ -1038,8 +1217,15 @@ export function buildRigGraph(rawInput: RawRigDef, includeDigitsAndJoints = true
   nodes.forEach((n) =>
     n.pieces.forEach((p) => {
       p.node = n;
-      p.i0 = p.i;
       p.wing = p.name === 'Backshoulder';
+      // Canonical shoulder-girdle depth invariant: Ribs (front) -> Swivel (middle) -> Back Shoulderbone (behind)
+      if (n.id === 'ribL') p.i = 32;
+      else if (n.id === 'swivelL') p.i = 33;
+      else if (p.wing && n.id === 'braceL') p.i = 34;
+      else if (n.id === 'ribR') p.i = 23;
+      else if (n.id === 'swivelR') p.i = 24;
+      else if (p.wing && n.id === 'braceR') p.i = 25;
+      p.i0 = p.i;
       pieces.push(p);
     }),
   );
@@ -1055,15 +1241,17 @@ export function buildRigGraph(rawInput: RawRigDef, includeDigitsAndJoints = true
   };
 }
 
-export function sortPiecesForWings(pieces: RigPiece[], popped: boolean): void {
+export function sortPiecesForWings(pieces: RigPiece[], _popped: boolean): void {
+  // Swivel stays strictly obscured behind Ribcage and ahead of Back Shoulderbone (Prometheus Wings) even when wings pop
   for (const p of pieces) {
-    const base = p.i0 ?? p.i;
-    if (p.wing && p.node) {
-      // Popped wings step cleanly in front of Ribcage/Swivel while remaining behind Arms & Shoulderbone
-      p.i = popped ? (p.node.id === 'braceR' ? 22.5 : 31.5) : base;
-    } else {
-      p.i = base;
-    }
+    const n = p.node;
+    if (n?.id === 'ribL') p.i = 32;
+    else if (n?.id === 'swivelL') p.i = 33;
+    else if (p.wing && n?.id === 'braceL') p.i = 34;
+    else if (n?.id === 'ribR') p.i = 23;
+    else if (n?.id === 'swivelR') p.i = 24;
+    else if (p.wing && n?.id === 'braceR') p.i = 25;
+    else p.i = p.i0 ?? p.i;
   }
   pieces.sort((a, b) => b.i - a.i);
 }
@@ -1399,6 +1587,7 @@ export function capturePoseSnapshot(
   instMap: Record<string, PartRigInstance>,
   abc?: PoseSnapshot['abc'],
   prometheusWings?: boolean,
+  bodyView?: BodyTurnView,
 ): PoseSnapshot {
   const pose: Record<string, number> = {};
   const coords: Record<string, [number, number]> = {};
@@ -1439,6 +1628,9 @@ export function capturePoseSnapshot(
   }
   if (prometheusWings) {
     snap.prometheusWings = true;
+  }
+  if (bodyView && bodyView !== 'front') {
+    snap.bodyView = bodyView;
   }
   return snap;
 }

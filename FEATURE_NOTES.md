@@ -4,10 +4,13 @@ These notes describe how every feature in Bitruvius works in plain language, why
 
 ---
 
-## 1. Core Rig & Bones
-- **43-Joint Forward Kinematics (`fkEngine.ts`)**: Moving a parent bone rotates all child bones below it, starting from the Pelvis (`root`) up through the dual spine (`lumbar` and `thorax`), out to the shoulders, arms, hands, legs, feet, and skull.
-- **Closed-Chain Shoulder Bond**: The collarbone (`brace`), shoulder swivel (`swivel`), shoulder tip (`acromion`), and shoulder tendon (`tendon`) stay linked together in a closed triangle. Pulling a shoulder lets it stretch cleanly without popping inside-out or crossing through the torso.
-- **Procedural Safeguards**: Tiny micro-scale cushions and angle soft stops keep joint math from dividing by zero or snapping at singularities, making the rig feel like a reliable cardboard/thin-metal physical puppet.
+## 1. Core Rig, Canonical Proportions & Posture Regimes
+- **43-Joint Forward Kinematics (`fkEngine.ts`, `rigRoles.ts`)**: Moving a parent bone rotates all child bones below it in strict parent-before-child topological order, starting from the Pelvis (`root`) up through the dual spine (`lumbar` and `thorax`), out to the shoulders, arms, hands, legs, feet, and skull, with automated hierarchy audits catching any orphan, cycle, or order mismatch.
+- **Public-Domain Proportions & Biomechanics (`jointLimits.ts`, `groundSystem.ts`)**: Reach limits, arm/leg spans, and counterweight follow classical proportion constants grounded in **Vitruvius** (*De architectura* III.1: thigh `1/4`, shin `1/4`, foot `1/6`, hand `1/10`), **Leonardo da Vinci** (*Vitruvian Man*: arm span = height `1:1`, forearm+hand `1/5`, upper arm `1/8`, equilateral leg-splay `1/14` height drop), and **Eadweard Muybridge** (*The Human Figure in Motion*: `62%` stance / `38%` swing stride phases and opposing contralateral arm-to-leg swing).
+- **Standing vs. Moving Regimes (`groundSystem.ts`, `motionTrack.ts`)**:
+  - *Standing*: Holds static vertical balance without injecting locomotion arm swing, checks arm-span-to-height proportions, and drops the pelvis smoothly toward Leonardo's `1/14` splay factor while keeping splayed feet planted on the floor.
+  - *Moving*: When root velocity, stride asymmetry during keyframes, or moving drag triggers motion, softly counter-swings opposite arms against legs (`armL <-> legR`, `armR <-> legL`) and shifts center-of-mass toward support without fighting direct drags or pinned joints.
+- **Closed-Chain Shoulder Bond & Deterministic Safeguards**: Collarbones, shoulder swivels, and tendons stay linked with self-corrective NaN/Infinity clamping, infinitesimal angle snapping (`1e-4°`), and zero-vector guards (`1e-3 px`) so joints never invert or snap inside-out.
 - **Soft Limits vs. Free Rotation**: When Soft Limits are turned on, each bone stops gently at natural anatomical angles (and shows a tension tint near the end of its range). When turned off, joints can rotate freely 360°.
 
 ## 2. Dual Spine, Anti-Phallic Engine, Rib Anchors & Chungus / Promethean Modes
@@ -29,6 +32,7 @@ These notes describe how every feature in Bitruvius works in plain language, why
 - **Skull Styling**:
   - Eye sockets stay hollow/skull-like by default (eye rounds deactivated), while white teeth remain visible.
   - Side and back skulls have distinct bone shading so orientation reads clearly at a glance.
+  - **`<->` Face Swivel Handle (`canvasRenderer.ts`)**: The face pivot (`lip` / `chinTip`) renders as a horizontal double-headed arrow (`<->`) aligned to the head axis rather than a circle, keeping it visually distinct from circular FK and IK handles and omitting circular FK limit arcs.
   - Jaw `lip` rotation stays locked cleanly at `0°` during swivel turns so the skull turns without accidentally popping the jaw open.
 
 ## 4. Digital Bones & Lens Blur (`canvasRenderer.ts`)
@@ -55,6 +59,6 @@ These notes describe how every feature in Bitruvius works in plain language, why
 - **Body Never Leaves Canvas**: Live world bounding checks clamp zooming, panning, root moves, and split-window slider adjustments so Bitruvius always stays framed inside the unobstructed viewport.
 - **First-Click Digital Canvas Backdrop Typography**: `"Welcome Bitruvius."` and the drag-hands instruction render in digital monospace (`JetBrains Mono`) behind the puppet between head crown and ankles, flipping overlapping letters to complementary studio green (`#22c55e`), and disappear automatically on the very first click (and on PNG export).
 
-## 9. ABC Keyframes, Motion Curves & Pose Library (`motionEngine.ts`, `motionFormat.ts`)
-- **A–E Keyframe Slots & Motion Feels**: Capture poses into A–E slots, scrub or loop between them with stepped FPS or smooth procedural timing (`Flow`, `Snap`, `Elastic`, `Mechanical`, `Clockwork`), and inspect onion-skin ghosts.
+## 9. ABC Keyframes, Procedural In-Between, Motion Curves & Pose Library (`motionEngine.ts`, `motionFormat.ts`)
+- **A–B–C Keyframes, Skull Turn Timing & Procedural In-Between**: Capture poses into A, B, and C slots (including the active 360° skull facing `headStep` / `skullView`), scrub or loop between them with stepped FPS or smooth procedural timing (`Flow`, `Snap`, `Elastic`, `Mechanical`, `Clockwork`, plus a second easing row for `Ease In`, `Ease Out`, `Double Ease`, and `Procedural`), and inspect onion-skin ghosts. A **Skull Turn** toggle in Cadence switches whether skull orientation shifts halfway between keyframe letters (`½ Tween`) or snaps cleanly onto the next letter (`On Letter`). When only **A** and **C** are filled, double-clicking **B** on the Set menu synthesizes a procedural breakdown in-between with intermediate skull rotation, core-to-distal overlap, Muybridge passing arcs, anatomical clamps, and ground preservation. `Procedural` motion feel lets the engine forge a clean C2-smooth path automatically between coarse keyframes without needing manual precision.
 - **Pose Library & Data Import/Export**: Save/rename/load poses locally, paste or copy full JSON state payloads (`RigStatePayload`), import/export `.bsk.json` skeletons, or render clean studio PNGs.
